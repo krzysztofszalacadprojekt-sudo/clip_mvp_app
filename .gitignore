@@ -1,0 +1,91 @@
+# ========================
+# OS & Environment
+# ========================
+.DS_Store
+Thumbs.db
+*Zone.Identifier
+.env
+
+# ========================
+# Python
+# ========================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.pyd
+.Python
+env/
+venv/
+clip_env/
+pip-log.txt
+pip-delete-this-directory.txt
+.tox/
+.nox/
+.eggs/
+*.egg-info/
+*.egg
+
+# PyInstaller / Build Artifacts
+build/
+dist/
+*.spec
+app/dist/
+app/build/
+
+# ========================
+# C++ / CMake
+# ========================
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+Makefile
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+
+# Visual Studio / MSVC / Builds
+.vs/
+*.obj
+*.exe
+*.pdb
+*.ilk
+*.lib
+*.exp
+*.dll
+Release/
+Debug/
+x64/
+x86/
+out/
+
+# ========================
+# Project Specific (Data, Models, Assets)
+# ========================
+embeddings/
+images/
+models/
+temp/
+client_assets/
+test_image.jpg
+
+# Zabezpieczenie przed ciężkimi plikami poza folderem models/
+*.pt
+*.pth
+*.onnx
+*.safetensors
+*.bin
+
+# Logi
+*.log
+logs/
+
+# Inne IDE
+.vscode/
+.idea/
+
+# Jupyter
+*.ipynb
+.ipynb_checkpoints/
+
+clip_model_api/

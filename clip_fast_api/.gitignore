@@ -1,0 +1,39 @@
+# Python build artifacts and environment
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+.Python
+env/
+venv/
+clip_env/
+pip-log.txt
+pip-delete-this-directory.txt
+.tox/
+.nox/
+.eggs/
+*.egg-info/
+*.egg
+dist/
+build/
+app/dist/
+app/build/
+
+# PyInstaller spec files
+*.spec
+
+# OS generated files
+.DS_Store
+*Zone.Identifier
+
+# Data, models, and test assets
+embeddings/
+images/
+models/
+temp/
+test_image.jpg
+client_assets/
+
+# Environment variables
+.env
