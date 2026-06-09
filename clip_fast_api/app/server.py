@@ -10,13 +10,13 @@ import onnxruntime as ort
 from fastapi import FastAPI, HTTPException, UploadFile, File, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from transformers import CLIPProcessor, CLIPTokenizerFast
+from transformers import AutoTokenizer, AutoProcessor
 
 from dotenv import load_dotenv
 
 from .image_preprocessor import preprocess_image
 from .clip_model import get_text_embedding as get_clip_text_embedding, get_image_embedding
-from .config import BASE_DIR, TOKENIZER_DIR
+from app import config
 from .embedding_store import (
     create_and_save_embeddings,
     load_index_and_paths,
@@ -63,12 +63,13 @@ async def lifespan(app: FastAPI):
         print("STEP 1: Loading tokenizer...")
         start = time.time()
 
-        if not TOKENIZER_DIR.exists():
-            raise FileNotFoundError(f"Tokenizer directory not found: {TOKENIZER_DIR}")
+        if not config.TOKENIZER_DIR.exists():
+            raise FileNotFoundError(f"Tokenizer directory not found: {config.TOKENIZER_DIR}")
 
-        app.state.tokenizer = CLIPTokenizerFast.from_pretrained(
-            str(TOKENIZER_DIR),
-            local_files_only=True
+        app.state.tokenizer = AutoTokenizer.from_pretrained(
+            str(config.TOKENIZER_DIR),
+            local_files_only=True,
+            fix_mistral_regex=False
         )
 
         print(f"✅ Tokenizer loaded in {time.time() - start:.2f}s")
@@ -117,15 +118,20 @@ def get_embedding_endpoint(prompt: TextPrompt, request: Request):
         raise HTTPException(status_code=503, detail="Tokenizer not loaded.")
 
     tokenizer = request.app.state.tokenizer
-    
+
+    max_length = config.TEXT_MAX_LENGTH
+    configured_max = tokenizer.init_kwargs.get("model_max_length")
+    if isinstance(configured_max, int) and 1 <= configured_max <= 512:
+        max_length = configured_max
+
     inputs = tokenizer(
         prompt.text,
         return_tensors="np",
         padding="max_length",
         truncation=True,
-        max_length=77,
+        max_length=max_length,
     )
-    
+
     try:
         text_embedding = get_clip_text_embedding(inputs)
         return {"embedding": text_embedding[0].tolist()}
@@ -168,19 +174,27 @@ def find_similar_images_by_text(prompt: TextPrompt, request: Request):
     global index, image_paths
     print(f"Received text search request: {prompt.text} (top_k={prompt.top_k})")
     start_time = time.time()
+    
     if index is None or image_paths is None:
         index, image_paths = load_index_and_paths()
         if index is None:
             raise HTTPException(status_code=400, detail="Index not found.")
     
     try:
-        tokenizer = request.app.state.tokenizer
-        inputs = tokenizer(
+        active_tokenizer = request.app.state.tokenizer
+
+        max_length = config.TEXT_MAX_LENGTH
+        configured_max = active_tokenizer.init_kwargs.get("model_max_length")
+        if isinstance(configured_max, int) and 1 <= configured_max <= 512:
+            max_length = configured_max
+
+        # Przygotowanie danych pod ONNX Runtime
+        inputs = active_tokenizer(
             prompt.text,
             return_tensors="np",
             padding="max_length",
             truncation=True,
-            max_length=77,
+            max_length=max_length,
         )
         
         text_embedding = get_clip_text_embedding(inputs)
@@ -190,7 +204,9 @@ def find_similar_images_by_text(prompt: TextPrompt, request: Request):
         elapsed = time.time() - start_time
         print(f"⏱️ Text search completed in {elapsed:.3f} seconds.")
         return JSONResponse(content=results)
+        
     except Exception as e:
+        print(f"❌ Search failed: {e}") # Dobrze dodać printa w konsoli serwera do podglądu
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/find-similar-images-by-image")

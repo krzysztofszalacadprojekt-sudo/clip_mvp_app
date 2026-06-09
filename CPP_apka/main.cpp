@@ -1,20 +1,87 @@
+#define NOMINMAX
 #include <iostream>
 #include <string>
 #include <curl/curl.h>
 #include <fstream>
 #include <map>
 #include <sstream>
+#include <limits>
+#include <cstdlib>
 
 std::ofstream logFile;
 
 void menu() {
     std::cout << "\n==== Menu ====\n";
     std::cout << "1. Update embeddings\n";
-    std::cout << "2. Get text embedding\n";
-    std::cout << "3. Search by text\n";
-    std::cout << "4. Search by image\n";
+    std::cout << "2. Search by text\n";
+    std::cout << "3. Search by image\n";
     std::cout << "0. Exit\n";
     std::cout << "Choose an option: ";
+}
+
+void process_and_display_results(const std::string& raw_json_response) {
+    std::cout << "\n📂 Processing search results using system commands...\n";
+    
+    // 1. Czyszczenie i tworzenie folderu za pomocą natywnych poleceń Windows (CMD)
+    // /s /q oznacza usuwanie folderu wraz z zawartością bez pytania użytkownika o zgodę
+    // 2>nul wycisza błędy systemu, jeśli folder jeszcze nie istnieje
+    std::system("rmdir /s /q search_results 2>nul");
+    std::system("mkdir search_results 2>nul");
+
+    std::string search_key = "\"path\":";
+    size_t pos = 0;
+    int file_counter = 1;
+
+    while ((pos = raw_json_response.find(search_key, pos)) != std::string::npos) {
+        pos += search_key.length();
+        
+        size_t start_quote = raw_json_response.find("\"", pos);
+        size_t end_quote = raw_json_response.find("\"", start_quote + 1);
+        
+        if (start_quote != std::string::npos && end_quote != std::string::npos) {
+            std::string source_path = raw_json_response.substr(start_quote + 1, end_quote - start_quote - 1);
+            
+            // Naprawa podwójnych backslashy (\\ -> \) z JSON-a
+            std::string clean_path = "";
+            for (size_t i = 0; i < source_path.length(); ++i) {
+                if (source_path[i] == '\\' && i + 1 < source_path.length() && source_path[i+1] == '\\') {
+                    clean_path += '\\';
+                    i++;
+                } else {
+                    clean_path += source_path[i];
+                }
+            }
+            if (clean_path.empty()) clean_path = source_path;
+
+            // 2. Wyciąganie samej nazwy pliku (np. krzeslo.jpg) za pomocą czystego std::string
+            size_t last_slash = clean_path.find_last_of("\\/");
+            std::string filename = (last_slash == std::string::npos) ? clean_path : clean_path.substr(last_slash + 1);
+
+            // 3. Budowanie systemowego polecenia 'copy' dla Windowsa
+            // Bierzemy ścieżki w cudzysłowy \"...\", aby spacje w nazwach folderów (np. CAD Projekt) nie rozbiły komendy
+            std::string copy_cmd = "copy \"" + clean_path + "\" \"search_results\\" + std::to_string(file_counter) + "_" + filename + "\" >nul 2>&1";
+            
+            // Wykonanie kopiowania przez powłokę systemową
+            int return_code = std::system(copy_cmd.c_str());
+            
+            if (return_code == 0) {
+                std::cout << "  [+] Match found! Copied: " << filename << "\n";
+                file_counter++;
+            } else {
+                // Kod różny od 0 oznacza zazwyczaj, że plik fizycznie nie istnieje pod wskazaną ścieżką lokalną
+                std::cout << "  [-] Could not copy (File not found locally): " << filename << "\n";
+            }
+        }
+        pos = end_quote + 1;
+    }
+
+    // 4. Jeśli pliki zostały skopiowane, otwieramy folder w Eksploratorze Windows
+    if (file_counter > 1) {
+        std::cout << "🎉 Success! Opening 'search_results' folder...\n";
+        std::system("start explorer search_results");
+    } else {
+        std::cout << "⚠️ No valid local image files could be copied from the server response.\n";
+    }
 }
 
 std::map<std::string, std::string> load_config(const std::string& filename) {
@@ -104,7 +171,7 @@ std::string build_directories_json(const std::string& dirs)
     return json;
 }
 
-void send_json_post(CURL* curl, const std::string& url, const std::string& json_payload) {
+std::string send_json_post(CURL* curl, const std::string& url, const std::string& json_payload) {
 
     if (logFile.is_open()) {
         logFile << "\n==== REQUEST ====\n";
@@ -136,9 +203,10 @@ void send_json_post(CURL* curl, const std::string& url, const std::string& json_
         }
     }
     curl_slist_free_all(headers);
+    return response;
 }
 
-void send_empty_post(CURL* curl, const std::string& url) {
+std::string send_empty_post(CURL* curl, const std::string& url) {
     curl_easy_reset(curl);
     std::string response;
 
@@ -154,9 +222,10 @@ void send_empty_post(CURL* curl, const std::string& url) {
     } else {
         std::cout << "✅ Response from " << url << ":\n" << response << "\n";
     }
+    return response;
 }
 
-void send_multipart_post(CURL* curl, const std::string& url, const std::string& file_path, const std::string& top_k) {
+std::string send_multipart_post(CURL* curl, const std::string& url, const std::string& file_path, const std::string& top_k) {
     if (logFile.is_open()) {
         logFile << "\n==== REQUEST (MULTIPART) ====\n";
         logFile << url << "\n";
@@ -172,7 +241,7 @@ void send_multipart_post(CURL* curl, const std::string& url, const std::string& 
     FILE* f = fopen(file_path.c_str(), "r");
     if (!f) {
         std::cout << "❌ Error: Cannot find image file '" << file_path << "' to upload.\n";
-        return;
+        return "";
     }
     fclose(f);
 
@@ -200,9 +269,11 @@ void send_multipart_post(CURL* curl, const std::string& url, const std::string& 
         }
     }
     curl_mime_free(form);
+    return response;
 }
 
 int main() {
+
     curl_global_init(CURL_GLOBAL_DEFAULT);
     CURL* curl = curl_easy_init();
 
@@ -214,78 +285,93 @@ int main() {
 
     logFile << "Program started\n";
 
-    auto config = load_config("config.txt");
-
-    std::string base_url = config["base_url"];
-    std::string image_path = config["image_path"];
-    std::string top_k = config["top_k"];
-    std::string directories = config["directories"];
-    std::string text = config["text"];
+    const std::string config_filename = "config.txt";
+    std::ifstream check_config(config_filename);
+    if (!check_config.good()) {
+        std::ofstream create_config(config_filename);
+        if (create_config.is_open()) {
+            create_config << R"(base_url=http://localhost:8000
+top_k=5
+directories=C:/Users/CAD/Desktop/clip_fast_api/images;
+target_image=C:/Users/CAD/Desktop/clip_fast_api/images/sofa.jpg
+)"; // <--- TUTAJ: Dodaliśmy domyślną ścieżkę do testowego zdjęcia
+            create_config.close();
+        }
+    } else {
+        check_config.close();
+    }
 
     int choice = -1;
 
     while (choice != 0) {
-        menu();
+        menu(); // Upewnij się, że w funkcji menu() zmieniłeś opisy na 1, 2, 3, 0
         if (!(std::cin >> choice)) {
             std::cin.clear();
             std::cin.ignore(10000, '\n');
             choice = -1;
+            continue;
         }
+
+        if (choice == 0) {
+            std::cout << "Exiting...\n";
+            break;
+        }
+
+        // Pobieranie infrastruktury z pliku konfiguracyjnego na bieżąco
+        auto config = load_config(config_filename);
+        std::string base_url = config["base_url"];
+        std::string top_k = config["top_k"];
+        std::string directories = config["directories"];
+
+        // Czyszczenie bufora strumienia wejściowego przed użyciem std::getline
+        std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
 
         switch (choice) {
             case 1: {
-                std::cout << "Updating embeddings...\n";
+                std::cout << "🚀 Updating embeddings...\n";
                 std::string json_payload = build_directories_json(directories);
-                send_json_post(
-                    curl,
-                    base_url + "/update-embeddings",
-                    json_payload
-                );
+                send_json_post(curl, base_url + "/update-embeddings", json_payload);
                 std::cout << "Done!\n";
                 break;
             }
 
-            case 2:
-                std::cout << "Getting embedding for text...\n";
-                send_json_post(curl, base_url + "/get-embedding", "{\"text\": \"" + text + "\", \"top_k\": " + top_k + "}");
-                break;
+            case 2: {
+                std::string search_query;
+                std::cout << "🔍 Enter text search query (e.g., modern oak chair): ";
+                std::getline(std::cin, search_query);
+                
+                std::cout << "Searching databases for: '" << search_query << "'...\n";
+                std::string response = send_json_post(curl, base_url + "/find-similar-images-by-text", "{\"text\": \"" + search_query + "\", \"top_k\": " + top_k + "}");
 
-            case 3:
-                std::cout << "Searching by text...\n";
-                send_json_post(curl, base_url + "/find-similar-images-by-text", "{\"text\": \"" + text + "\", \"top_k\": " + top_k + "}");
+                process_and_display_results(response);
                 break;
+            }
 
-            case 4:
-                std::cout << "Searching by image...\n";
-                send_multipart_post(curl, base_url + "/find-similar-images-by-image", image_path, top_k);
-                break;
+            case 3: {
+                // 📂 Pobieramy ścieżkę bezpośrednio z pliku konfiguracyjnego
+                std::string image_input = config["target_image"];
+                
+                if (image_input.empty()) {
+                    std::cout << "⚠️ Error: 'target_image' is not defined in config.txt!\n";
+                    break;
+                }
+                
+                std::cout << "🖼️ Executing visual lookup for asset from config: '" << image_input << "'...\n";
+                
+                // Wysyłamy zapytanie do serwera FastAPI
+                std::string response = send_multipart_post(curl, base_url + "/find-similar-images-by-image", image_input, top_k);
 
-            case 0:
-                std::cout << "Exiting...\n";
+                // Kopiujemy i otwieramy folder z wynikami
+                process_and_display_results(response);
                 break;
+            }
 
             default:
-                std::cout << "Invalid choice.\n";
+                std::cout << "Invalid choice. Try again.\n";
         }
+        
+        std::cout << "\n----------------------------------------\n";
     }
-
-    // if (curl) {
-    //     send_json_post(curl, base_url + "/update-embeddings",
-    //         "{\"directories\": [\"" + directories + "\"]}");
-
-    //     send_json_post(curl, base_url + "/get-embedding",
-    //         "{\"text\": \"" + text + "\", \"top_k\": " + top_k + "}");
-
-    //     send_json_post(curl, base_url + "/find-similar-images-by-text",
-    //         "{\"text\": \"" + text + "\", \"top_k\": " + top_k + "}");
-
-    //     send_multipart_post(curl,
-    //         base_url + "/find-similar-images-by-image",
-    //         image_path,
-    //         top_k);
-
-    //     curl_easy_cleanup(curl);
-    // }
 
     if (curl) {
         curl_easy_cleanup(curl);
