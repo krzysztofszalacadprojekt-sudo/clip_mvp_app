@@ -5,7 +5,7 @@ echo ==============================
 echo Starting FastAPI backend...
 echo ==============================
 
-start "" /D "%~dp0clip_fast_api" server.exe
+start "" /D "%~dp0clip_fast_api\dist\server\" server.exe
 
 echo Waiting for backend to start...
 
@@ -18,7 +18,7 @@ echo ==============================
 echo Starting C++ application...
 echo ==============================
 
-cd /d "%~dp0CPP_apka\Release"
+cd /d "%~dp0CPP_apka\build\Release"
 start "" TestBackend.exe
 
 echo All started.

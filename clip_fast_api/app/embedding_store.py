@@ -13,6 +13,8 @@ import traceback
 import psutil
 import platform
 import subprocess
+import sqlite3
+import time
 
 # --- Dynamic Batch Size Calculation ---
 
@@ -40,41 +42,61 @@ def _get_available_vram_bytes():
 
 def _get_dynamic_batch_size():
     try:
-        # 1. Check RAM
+        # 1. Odczyt systemowej pamięci RAM
         available_ram = psutil.virtual_memory().available
         available_ram_gb = available_ram / (1024 ** 3)
+        total_ram_gb = psutil.virtual_memory().total / (1024 ** 3)
         
-        # CRITICAL HARD FLOOR: If total available RAM is critically low, 
-        # force batch_size=1 instantly. Do not let math dictate a higher number.
+        # Krytyczna blokada dla bardzo słabych maszyn
         if available_ram_gb < 2.5:
-            print(f"⚠️ Critically low RAM detected ({available_ram_gb:.2f} GB). Forcing safe batch size of 1.")
+            print(f"⚠️ Wykryto krytycznie niski poziom RAM ({available_ram_gb:.2f} GB). Wymuszenie bezpiecznego batch_size = 1.")
             return 1
 
         usable_ram = available_ram * RAM_TARGET_FRACTION
         ram_batch_size = int(usable_ram // MEMORY_PER_IMAGE_BYTES)
 
-        # 2. Calculate VRAM constraints
-        # Ensure your helper function ONLY returns DEDICATED VRAM, not shared system VRAM!
+        # 2. Odczyt dedykowanej pamięci VRAM
         vram_bytes = _get_available_vram_bytes() 
+        vram_gb = vram_bytes / (1024 ** 3)
+        
         usable_vram = vram_bytes * 0.7 
         available_vram_for_batch = max(0, usable_vram - BASE_MODEL_VRAM_BYTES)
         vram_batch_size = int(available_vram_for_batch // ONNX_VRAM_PER_IMAGE_BYTES)
 
-        # Take the most restrictive limit
+        # 3. DYNAMICZNE USTALANIE MAKSYMALNEGO SUFITU (Hardware Tiering)
+        # Urealnione progi dopasowane do rzeczywistych specyfikacji GPU
+        if vram_gb >= 11.0 and total_ram_gb >= 23.0:
+            # Klasa Workstation (karty 12GB, 16GB, 24GB VRAM + 32GB+ RAM)
+            adaptive_max_batch = 128
+            tier_name = "High-End Workstation Rig"
+            
+        elif vram_gb >= 5.0 and total_ram_gb >= 11.0:
+            # Klasa Średnia/Produkcyjna (karty 6GB, 8GB VRAM + 16GB RAM)
+            # Teraz Twoja karta (nawet 6GB) bez problemu wpadnie tutaj!
+            adaptive_max_batch = 64
+            tier_name = "Standard Production Rig"
+            
+        else:
+            # Klasa podstawowa / biurowa / fallback przy błędzie detekcji
+            # Podnosimy sufit z 16 na 32, skoro sprawdziłeś, że 32 działa u Ciebie idealnie.
+            adaptive_max_batch = 32
+            tier_name = "Safe Guardrail Mode"
+
+        # 4. Wybór najbardziej rygorystycznego ograniczenia z obliczonych matematycznie
         calculated_batch_size = min(ram_batch_size, vram_batch_size)
 
-        # Apply strict clamping bounds
-        dynamic_batch_size = max(MIN_BATCH_SIZE, min(calculated_batch_size, MAX_BATCH_SIZE))
+        # 5. Spięcie wyniku w bezpiecznych, wyliczonych dynamicznie widełkach
+        dynamic_batch_size = max(MIN_BATCH_SIZE, min(calculated_batch_size, adaptive_max_batch))
         
-        print(f"Available RAM: {available_ram_gb:.2f} GB | Detected VRAM: {vram_bytes / (1024 ** 3):.2f} GB")
-        print(f"RAM constraint: {ram_batch_size} max | VRAM constraint: {vram_batch_size} max")
-        print(f"🚀 Dynamic batch size safely set to: {dynamic_batch_size}")
+        print(f"--- Wykryto profil sprzętowy: {tier_name} ---")
+        print(f"Dostępny RAM: {available_ram_gb:.2f} GB | Wykryty VRAM: {vram_gb:.2f} GB")
+        print(f"Matematyczny limit RAM: {ram_batch_size} | Limit VRAM: {vram_batch_size} | Dynamiczny Sufit Klasy: {adaptive_max_batch}")
+        print(f"🚀 Bezpieczny rozmiar partii (Batch Size) ustawiony na: {dynamic_batch_size}")
         return dynamic_batch_size
 
     except Exception as e:
-        print(f"Resource detection failed ({e}). Falling back to default batch size of 1.")
+        print(f"Automatyczna detekcja zasobów nie powiodła się ({e}). Powrót do bezpiecznego bezpiecznika = 1.")
         return 1
-
 
 def embed_images_batch(image_paths: List[str]):
     """
@@ -170,10 +192,8 @@ def create_and_save_embeddings(image_paths: List[str] = None):
         
 def load_index_and_paths():
     """
-    Loads the FAISS index and the list of image paths.
-
-    If duplicates are detected in the stored paths, it rebuilds the index from the
-    unique set of paths to avoid returning repeated results.
+    Ładuje indeks FAISS oraz listę ścieżek obrazów z dysku do pamięci RAM.
+    Wersja czysta: wczytuje dane w relacji 1:1 dokładnie tak, jak zostały zapisane.
     """
     if not FAISS_INDEX_PATH.exists() or not IMAGE_PATHS_LIST.exists():
         return None, None
@@ -182,28 +202,15 @@ def load_index_and_paths():
     with open(IMAGE_PATHS_LIST, "r", encoding="utf-8") as f:
         image_paths = json.load(f)
 
-    # Normalize stored paths so comparisons remain consistent across runs
+    # Spójna normalizacja ścieżek bez zmieniania długości tablicy!
     normalized_paths = [str(Path(p).expanduser().resolve()) for p in image_paths]
-
-    # Deduplicate while preserving order
-    seen = set()
-    unique_paths = []
-    for p in normalized_paths:
-        if p not in seen:
-            seen.add(p)
-            unique_paths.append(p)
-
-    if len(unique_paths) != len(normalized_paths):
-        # Rebuild index from unique list to remove duplicates
-        create_and_save_embeddings(unique_paths)
-        index = faiss.read_index(str(FAISS_INDEX_PATH))
-        normalized_paths = unique_paths
 
     return index, normalized_paths
 
 def search_similar_images(query_embedding, index, image_paths, top_k=5):
     """
-    Searches the FAISS index for the most similar images.
+    Bezpieczna funkcja przeszukiwania indeksu FAISS.
+    Odporna na błędy synchronizacji (IndexError) oraz puste wyniki (-1).
     """
     query_embedding = query_embedding.astype('float32')
     faiss.normalize_L2(query_embedding)
@@ -211,14 +218,29 @@ def search_similar_images(query_embedding, index, image_paths, top_k=5):
     distances, indices = index.search(query_embedding, top_k)
     
     results = []
+    # Sprawdzenie czy FAISS w ogóle cokolwiek zwrócił
+    if len(indices) == 0 or len(indices[0]) == 0:
+        return results
+        
     for i in range(top_k):
         if i < len(indices[0]):
-            results.append(
-                {
-                    "path": image_paths[indices[0][i]],
-                    "distance": float(distances[0][i])
-                }
-            )
+            idx = indices[0][i]
+            
+            # FAISS zwraca -1, jeśli indeks jest pusty lub szukamy więcej wyników niż jest w bazie
+            if idx == -1:
+                continue
+                
+            # Defensywne sprawdzenie granic tablicy (Zabezpieczenie przed list index out of range)
+            if 0 <= idx < len(image_paths):
+                results.append(
+                    {
+                        "path": image_paths[idx],
+                        "distance": float(distances[0][i])
+                    }
+                )
+            else:
+                print(f"⚠️ [Defensive Guard] FAISS zwrócił indeks {idx}, ale image_paths ma tylko {len(image_paths)} elementów! Pomijam.")
+                
     return results
 
 def update_embeddings(directories: List[str]):
@@ -379,3 +401,184 @@ def update_embeddings(directories: List[str]):
         f"Embeddings updated with "
         f"{len(valid_new_paths)} new images."
     )
+
+def update_embeddings_from_db(db_path: str) -> str:
+    """
+    Dwukierunkowa pętla uzgadniania stanu z obsługą relacji 1-do-wielu.
+    Grupuje modele po unikalnych ścieżkach plików graficznych, optymalizując
+    prace SigLIP 2 i eliminując duplikaty wektorów w bazie FAISS.
+    """
+    print("\n=== SYSTEM SYNCHRONIZACJI Z AUTOMATYCZNYM GARBAGE COLLECTOREM V5 ===")
+    start_check = time.time()
+    CHECKPOINT_SIZE = 1000
+    
+    # 1. Pobieramy aktualny stan z dysku
+    index, image_paths_list = load_index_and_paths()
+    if image_paths_list is None:
+        image_paths_list = []
+        
+    index_total_vectors = index.ntotal if index is not None else 0
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    
+    path_groups = {}
+    images_to_embed = []
+    healed_to_exists = 0
+    healed_to_missing = 0
+
+    try:
+        cursor = conn.cursor()
+        
+        # Pobieramy wszystkie ścieżki z bazy
+        cursor.execute("SELECT id, name, jpg_path, image_embedding_exists FROM models WHERE jpg_path IS NOT NULL")
+        rows = cursor.fetchall()
+
+        if not rows:
+            return "Baza danych SQLite jest pusta."
+
+        # Grupowanie po unikalnych ścieżkach obrazów
+        with conn:
+            for row in rows:
+                model_id = row["id"]
+                db_flag = row["image_embedding_exists"]
+                raw_path = row["jpg_path"].strip()
+
+                if raw_path.upper().startswith("C:"):
+                    remainder = raw_path[2:].lstrip(" \\")
+                    raw_path = "C:\\" + remainder
+
+                p = Path(raw_path)
+                if not p.suffix:
+                    p = p.with_suffix(".jpg")
+
+                target_path = None
+                if p.exists():
+                    target_path = p
+                else:
+                    parent_dir = p.parent.parent
+                    fallback_path = parent_dir / p.name
+                    if parent_dir.exists() and fallback_path.exists():
+                        target_path = fallback_path
+                        new_path_str = str(fallback_path.resolve())
+                        cursor.execute("UPDATE models SET jpg_path = ? WHERE id = ?", (new_path_str, model_id))
+
+                if target_path:
+                    resolved_path_str = str(target_path.expanduser().resolve())
+                    if resolved_path_str not in path_groups:
+                        path_groups[resolved_path_str] = []
+                    path_groups[resolved_path_str].append({"id": model_id, "flag": db_flag})
+
+        # ---------------------------------------------------------------------
+        # 🚀 AUTOMATYCZNY GARBAGE COLLECTOR (SAMOCZYSZCZENIE)
+        # ---------------------------------------------------------------------
+        total_unique_db_images = len(path_groups)
+        
+        # Jeśli FAISS ma więcej wektorów niż baza ma unikalnych zdjęć -> mamy duchy!
+        if index_total_vectors > total_unique_db_images:
+            ghost_count = index_total_vectors - total_unique_db_images
+            
+            # Próg aktywacji sprzątania: np. więcej niż 500 śmieci lub 5% całej bazy
+            if ghost_count > 500 or (ghost_count / total_unique_db_images) > 0.05:
+                print(f"🧹 [Garbage Collector] Wykryto {ghost_count} nieużywanych wektorów-duchów u klienta.")
+                print("🧹 [Garbage Collector] Uruchamiam automatyczne czyszczenie i optymalizację indeksu...")
+                
+                # Zamykamy/usuwamy stary indeks w pamięci RAM
+                index = None
+                image_paths_list = []
+                existing_paths = set()
+                
+                # Usuwamy pliki fizyczne z dysku, aby pętla zbudowała je na czysto
+                if FAISS_INDEX_PATH.exists(): FAISS_INDEX_PATH.unlink()
+                if IMAGE_PATHS_LIST.exists(): IMAGE_PATHS_LIST.unlink()
+                
+                # Resetujemy flagi w SQLite do zera, żeby pętla przemieliła wszystko prawidłowo
+                with conn:
+                    cursor.execute("UPDATE models SET image_embedding_exists = 0")
+                
+                print("🧹 [Garbage Collector] Pliki zresetowane. Rozpoczynam automatyczną re-indeksację...")
+            else:
+                # Duchów jest mało (np. kilka sztuk) - ignorujemy, nie ma sensu marnować czasu klienta
+                existing_paths = set(image_paths_list)
+        else:
+            existing_paths = set(image_paths_list)
+        # ---------------------------------------------------------------------
+
+        # KROK B: Dwukierunkowe uzgadnianie stanów (Reconciliation)
+        with conn:
+            for resolved_path_str, models in path_groups.items():
+                is_in_faiss = resolved_path_str in existing_paths
+                
+                for m in models:
+                    if is_in_faiss and m["flag"] == 0:
+                        cursor.execute("UPDATE models SET image_embedding_exists = 1 WHERE id = ?", (m["id"],))
+                        healed_to_exists += 1
+                    elif not is_in_faiss and m["flag"] == 1:
+                        cursor.execute("UPDATE models SET image_embedding_exists = 0 WHERE id = ?", (m["id"],))
+                        healed_to_missing += 1
+                
+                if not is_in_faiss:
+                    images_to_embed.append(resolved_path_str)
+
+        print(f"⏱️ Weryfikacja spójności unikalnych zasobów zakończona w {time.time() - start_check:.4f}s.")
+        print(f"📊 Statystyki struktury: Wykryto {len(path_groups)} unikalnych zdjęć dla {len(rows)} modeli bazy.")
+        
+        if healed_to_exists > 0 or healed_to_missing > 0:
+            print(f"⚡ [Self-Healing] Dostrojono flagi relacji: oznaczono jako istniejące: {healed_to_exists}, zresetowano: {healed_to_missing}")
+
+        total_images_to_process = len(images_to_embed)
+        if total_images_to_process == 0:
+            return "Wszystkie systemy są w harmonii. Indeks FAISS (Unikalny) i baza SQLite są idealnie zsynchronizowane."
+
+        print(f"🚀 Do faktycznego przetworzenia przez SigLIP 2 pozostało: {total_images_to_process} UNIKALNYCH obrazów.")
+        print(f"💾 Punkty kontrolne (Checkpoints) zabezpieczą dysk co {CHECKPOINT_SIZE} zdjęć.")
+
+        # --- GŁÓWNA PĘTLA BLOKOWA DLA EMBEDDINGÓW ---
+        checkpoint_count = 0
+        for i in range(0, total_images_to_process, CHECKPOINT_SIZE):
+            chunk_paths = images_to_embed[i : i + CHECKPOINT_SIZE]
+            current_block_num = (i // CHECKPOINT_SIZE) + 1
+            total_blocks = (total_images_to_process + CHECKPOINT_SIZE - 1) // CHECKPOINT_SIZE
+            
+            print(f"\n📦 [Blok {current_block_num}/{total_blocks}] Przetwarzanie partii {len(chunk_paths)} unikalnych zdjęć...")
+            
+            new_embeddings, valid_new_paths = embed_images_batch(chunk_paths)
+            
+            if new_embeddings.shape[0] == 0 or not valid_new_paths:
+                continue
+
+            if index is None:
+                import faiss
+                index = faiss.IndexFlatIP(new_embeddings.shape[1])
+            
+            index.add(new_embeddings)
+            image_paths_list.extend(valid_new_paths)
+
+            # Zapis indeksu .bin
+            tmp_index = str(FAISS_INDEX_PATH) + ".tmp"
+            faiss.write_index(index, tmp_index)
+            os.replace(tmp_index, str(FAISS_INDEX_PATH))
+            
+            # Zapis ścieżek .json
+            tmp_json = str(IMAGE_PATHS_LIST) + ".tmp"
+            with open(tmp_json, "w", encoding="utf-8") as f:
+                json.dump(image_paths_list, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_json, IMAGE_PATHS_LIST)
+
+            # MASOWA AKTUALIZACJA: Włączamy flagę '1' dla WSZYSTKICH modeli powiązanych z przetworzonymi ścieżkami
+            with conn:
+                for path in valid_new_paths:
+                    associated_models = path_groups.get(path, [])
+                    for m in associated_models:
+                        cursor.execute("UPDATE models SET image_embedding_exists = 1 WHERE id = ?", (m["id"],))
+
+            checkpoint_count += len(valid_new_paths)
+            print(f"🔒 [Checkpoint Zablokowany] Postęp zapisu unikalnych: {i + len(chunk_paths)} / {total_images_to_process}")
+
+        return f"Synchronizacja udana. Przetworzono unikalnych obrazów: {checkpoint_count}."
+
+    except sqlite3.Error as e:
+        print(f"❌ Krytyczny błąd bazy danych podczas pętli uzgadniania V4: {e}")
+        raise
+    finally:
+        conn.close()

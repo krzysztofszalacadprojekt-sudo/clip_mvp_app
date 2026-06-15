@@ -1,6 +1,6 @@
 from PIL import Image
 from transformers import AutoProcessor  # 1. Switched to generic AutoProcessor
-from .config import BASE_DIR, MODELS_DIR, TOKENIZER_DIR
+from .config import MODELS_DIR, TOKENIZER_DIR
 
 # Lazy initialization global
 processor = None
@@ -17,22 +17,10 @@ def _init_processor():
         # AutoProcessor dynamically reads the unique preprocessor_config.json
         processor = AutoProcessor.from_pretrained(
             str(TOKENIZER_DIR), 
-            local_files_only=True
+            local_files_only=True,
+            fix_mistral_regex=False
         )
         print("Processor initialized.")
-
-# def preprocess_image(image_path: str):
-#     """
-#     Loads and preprocesses an image dynamically matching the active model's required shape.
-#     """
-#     _init_processor()
-#     image = Image.open(image_path).convert("RGB")
-    
-#     # 3. REMOVED hardcoded image.resize((224, 224)) line entirely.
-#     # The processor reads the JSON configuration and handles resizing natively.
-#     inputs = processor(images=image, return_tensors="np")
-    
-#     return inputs["pixel_values"]
 
 def preprocess_image(image_path: str):
     """

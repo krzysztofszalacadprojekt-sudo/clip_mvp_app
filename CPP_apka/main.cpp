@@ -7,7 +7,10 @@
 #include <sstream>
 #include <limits>
 #include <cstdlib>
+#include <filesystem>
+#include <windows.h> // Potrzebne do MultiByteToWideChar
 
+namespace fs = std::filesystem;
 std::ofstream logFile;
 
 void menu() {
@@ -19,14 +22,41 @@ void menu() {
     std::cout << "Choose an option: ";
 }
 
-void process_and_display_results(const std::string& raw_json_response) {
-    std::cout << "\n📂 Processing search results using system commands...\n";
+std::string console_to_utf8(const std::string& input) {
+    if (input.empty()) return "";
     
-    // 1. Czyszczenie i tworzenie folderu za pomocą natywnych poleceń Windows (CMD)
-    // /s /q oznacza usuwanie folderu wraz z zawartością bez pytania użytkownika o zgodę
-    // 2>nul wycisza błędy systemu, jeśli folder jeszcze nie istnieje
-    std::system("rmdir /s /q search_results 2>nul");
-    std::system("mkdir search_results 2>nul");
+    // 1. Pobieramy aktualną stronę kodową wejścia terminala klienta (np. 852)
+    UINT current_cp = GetConsoleCP();
+    
+    // Krok A: Konwersja lokalnego kodowania konsoli -> UTF-16 (wstring)
+    int wlen = MultiByteToWideChar(current_cp, 0, input.c_str(), (int)input.length(), NULL, 0);
+    std::wstring wstr(wlen, 0);
+    MultiByteToWideChar(current_cp, 0, input.c_str(), (int)input.length(), &wstr[0], wlen);
+    
+    // Krok B: Konwersja UTF-16 (wstring) -> Czysty, uniwersalny UTF-8 (string)
+    int u8len = WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), (int)wstr.length(), NULL, 0, NULL, NULL);
+    std::string u8str(u8len, 0);
+    WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), (int)wstr.length(), &u8str[0], u8len, NULL, NULL);
+    
+    return u8str;
+}
+
+// Pomocnicza funkcja konwertująca UTF-8 string na Windowsowy wstring
+std::wstring utf8_to_wstring(const std::string& str) {
+    if (str.empty()) return L"";
+    int size_needed = MultiByteToWideChar(CP_UTF8, 0, &str[0], (int)str.size(), NULL, 0);
+    std::wstring wstrTo(size_needed, 0);
+    MultiByteToWideChar(CP_UTF8, 0, &str[0], (int)str.size(), &wstrTo[0], size_needed);
+    return wstrTo;
+}
+
+void process_and_display_results(const std::string& raw_json_response) {
+    std::cout << "\nProcessing search results using native C++ filesystem...\n";
+    
+    // Czyszczenie i tworzenie folderu w bezpieczny sposób przez bibliotekę C++
+    fs::path target_dir("search_results");
+    fs::remove_all(target_dir);
+    fs::create_directories(target_dir);
 
     std::string search_key = "\"path\":";
     size_t pos = 0;
@@ -53,34 +83,36 @@ void process_and_display_results(const std::string& raw_json_response) {
             }
             if (clean_path.empty()) clean_path = source_path;
 
-            // 2. Wyciąganie samej nazwy pliku (np. krzeslo.jpg) za pomocą czystego std::string
-            size_t last_slash = clean_path.find_last_of("\\/");
-            std::string filename = (last_slash == std::string::npos) ? clean_path : clean_path.substr(last_slash + 1);
+            // Konwersja na bezpieczne ścieżki Windows (Wide-char) z pełną obsługą polskich liter
+            std::wstring w_clean_path = utf8_to_wstring(clean_path);
+            fs::path src_file(w_clean_path);
 
-            // 3. Budowanie systemowego polecenia 'copy' dla Windowsa
-            // Bierzemy ścieżki w cudzysłowy \"...\", aby spacje w nazwach folderów (np. CAD Projekt) nie rozbiły komendy
-            std::string copy_cmd = "copy \"" + clean_path + "\" \"search_results\\" + std::to_string(file_counter) + "_" + filename + "\" >nul 2>&1";
-            
-            // Wykonanie kopiowania przez powłokę systemową
-            int return_code = std::system(copy_cmd.c_str());
-            
-            if (return_code == 0) {
-                std::cout << "  [+] Match found! Copied: " << filename << "\n";
-                file_counter++;
+            if (fs::exists(src_file)) {
+                std::wstring w_filename = src_file.filename().wstring();
+                std::wstring w_dest_name = std::to_wstring(file_counter) + L"_" + w_filename;
+                fs::path dest_file = target_dir / w_dest_name;
+
+                std::error_code ec;
+                fs::copy_file(src_file, dest_file, fs::copy_options::overwrite_existing, ec);
+
+                if (!ec) {
+                    std::wcout << L"  [+] Match found! Copied: " << w_filename << L"\n";
+                    file_counter++;
+                } else {
+                    std::cout << "  [-] Copy failed (System file system error)\n";
+                }
             } else {
-                // Kod różny od 0 oznacza zazwyczaj, że plik fizycznie nie istnieje pod wskazaną ścieżką lokalną
-                std::cout << "  [-] Could not copy (File not found locally): " << filename << "\n";
+                std::wcout << L"  [-] Could not find file locally: " << src_file.filename().wstring() << L"\n";
             }
         }
         pos = end_quote + 1;
     }
 
-    // 4. Jeśli pliki zostały skopiowane, otwieramy folder w Eksploratorze Windows
     if (file_counter > 1) {
-        std::cout << "🎉 Success! Opening 'search_results' folder...\n";
+        std::cout << "Success! Opening 'search_results' folder...\n";
         std::system("start explorer search_results");
     } else {
-        std::cout << "⚠️ No valid local image files could be copied from the server response.\n";
+        std::wcout << L"No valid local image files could be copied from the server response.\n";
     }
 }
 
@@ -194,9 +226,9 @@ std::string send_json_post(CURL* curl, const std::string& url, const std::string
 
     CURLcode res = curl_easy_perform(curl);
     if (res != CURLE_OK) {
-        std::cout << "❌ Request failed (" << url << "): " << curl_easy_strerror(res) << "\n";
+        std::cout << "Request failed (" << url << "): " << curl_easy_strerror(res) << "\n";
     } else {
-        std::cout << "✅ Response from " << url << ":\n" << response << "\n";
+        std::cout << "Response from " << url << ":\n" << response << "\n";
         if (logFile.is_open()) {
             logFile << "\n==== RESPONSE ====\n";
             logFile << response << "\n";
@@ -218,9 +250,9 @@ std::string send_empty_post(CURL* curl, const std::string& url) {
 
     CURLcode res = curl_easy_perform(curl);
     if (res != CURLE_OK) {
-        std::cout << "❌ Request failed (" << url << "): " << curl_easy_strerror(res) << "\n";
+        std::wcout << L"Request failed (" << utf8_to_wstring(url) << L"): " << utf8_to_wstring(curl_easy_strerror(res)) << L"\n";
     } else {
-        std::cout << "✅ Response from " << url << ":\n" << response << "\n";
+        std::wcout << L"Response from " << utf8_to_wstring(url) << L":\n" << utf8_to_wstring(response) << L"\n";
     }
     return response;
 }
@@ -240,7 +272,7 @@ std::string send_multipart_post(CURL* curl, const std::string& url, const std::s
 
     FILE* f = fopen(file_path.c_str(), "r");
     if (!f) {
-        std::cout << "❌ Error: Cannot find image file '" << file_path << "' to upload.\n";
+        std::wcout << L"Error: Cannot find image file '" << utf8_to_wstring(file_path) << L"' to upload.\n";
         return "";
     }
     fclose(f);
@@ -260,9 +292,9 @@ std::string send_multipart_post(CURL* curl, const std::string& url, const std::s
 
     CURLcode res = curl_easy_perform(curl);
     if (res != CURLE_OK) {
-        std::cout << "❌ Request failed (" << url << "): " << curl_easy_strerror(res) << "\n";
+        std::wcout << L"Request failed (" << utf8_to_wstring(url) << L"): " << utf8_to_wstring(curl_easy_strerror(res)) << L"\n";
     } else {
-        std::cout << "✅ Response from " << url << ":\n" << response << "\n";
+        std::wcout << L"Response from " << utf8_to_wstring(url) << L":\n" << utf8_to_wstring(response) << L"\n";
         if (logFile.is_open()) {
             logFile << "\n==== RESPONSE ====\n";
             logFile << response << "\n";
@@ -328,19 +360,27 @@ target_image=C:/Users/CAD/Desktop/clip_fast_api/images/sofa.jpg
 
         switch (choice) {
             case 1: {
-                std::cout << "🚀 Updating embeddings...\n";
+                std::wcout << L"Updating embeddings...\n";
                 std::string json_payload = build_directories_json(directories);
                 send_json_post(curl, base_url + "/update-embeddings", json_payload);
-                std::cout << "Done!\n";
+                std::wcout << L"Done!\n";
                 break;
             }
 
             case 2: {
-                std::string search_query;
-                std::cout << "🔍 Enter text search query (e.g., modern oak chair): ";
-                std::getline(std::cin, search_query);
+                std::string local_input;
+                std::cout << "Enter text search query (e.g., modern oak chair): ";
                 
-                std::cout << "Searching databases for: '" << search_query << "'...\n";
+                // 1. Pobieramy surowy ciąg znaków z konsoli w lokalnym kodowaniu systemu
+                std::getline(std::cin, local_input);
+                
+                // 2. 🚀 KLUCZOWE: Tłumaczymy znaki terminala na czysty standard internetowy UTF-8
+                std::string search_query = console_to_utf8(local_input);
+                
+                // Wyświetlamy w konsoli informację diagnostyczną (używając wcout i wstring)
+                std::wcout << L"Searching databases for: '" << utf8_to_wstring(search_query) << L"'...\n";
+                
+                // 3. Wysyłamy bezpieczny, poprawnie sformatowany JSON do FastAPI
                 std::string response = send_json_post(curl, base_url + "/find-similar-images-by-text", "{\"text\": \"" + search_query + "\", \"top_k\": " + top_k + "}");
 
                 process_and_display_results(response);
@@ -348,15 +388,15 @@ target_image=C:/Users/CAD/Desktop/clip_fast_api/images/sofa.jpg
             }
 
             case 3: {
-                // 📂 Pobieramy ścieżkę bezpośrednio z pliku konfiguracyjnego
+                //  Pobieramy ścieżkę bezpośrednio z pliku konfiguracyjnego
                 std::string image_input = config["target_image"];
                 
                 if (image_input.empty()) {
-                    std::cout << "⚠️ Error: 'target_image' is not defined in config.txt!\n";
+                    std::cout << "Error: 'target_image' is not defined in config.txt!\n";
                     break;
                 }
                 
-                std::cout << "🖼️ Executing visual lookup for asset from config: '" << image_input << "'...\n";
+                std::cout << "Executing visual lookup for asset from config: '" << image_input << "'...\n";
                 
                 // Wysyłamy zapytanie do serwera FastAPI
                 std::string response = send_multipart_post(curl, base_url + "/find-similar-images-by-image", image_input, top_k);
@@ -365,6 +405,16 @@ target_image=C:/Users/CAD/Desktop/clip_fast_api/images/sofa.jpg
                 process_and_display_results(response);
                 break;
             }
+
+            // case 4: {
+            //     std::string search_query = config["text"];
+                
+            //     std::cout << "Searching databases for: '" << search_query << "'...\n";
+            //     std::string response = send_json_post(curl, base_url + "/find-similar-images-by-text", "{\"text\": \"" + search_query + "\", \"top_k\": " + top_k + "}");
+
+            //     process_and_display_results(response);
+            //     break;
+            // }
 
             default:
                 std::cout << "Invalid choice. Try again.\n";

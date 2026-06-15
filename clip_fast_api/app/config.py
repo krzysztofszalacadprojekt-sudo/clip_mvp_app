@@ -7,20 +7,45 @@ from dotenv import load_dotenv
 # Load environmental overrides if present
 load_dotenv()
 
+print(Path(__file__).resolve())
+
 # =====================================================================
 # 1. CORE PROJECT ROUTING (PyInstaller Safe)
 # =====================================================================
-if getattr(sys, "frozen", False):
-    BASE_DIR = Path(sys.executable).parent
-else:
-    BASE_DIR = Path(__file__).resolve().parent.parent
 
-# =====================================================================
-# 2. DIRECTORY STRUCTURE
-# =====================================================================
-MODELS_DIR = Path(os.getenv("MODELS_DIR", BASE_DIR / "models"))
-IMAGES_DIR = Path(os.getenv("IMAGES_DIR", BASE_DIR / "images"))
-EMBEDDINGS_DIR = Path(os.getenv("EMBEDDINGS_DIR", BASE_DIR / "embeddings"))
+if getattr(sys, "frozen", False):
+    # server.exe
+    EXE_DIR = Path(sys.executable).resolve().parent
+
+    # MyApp
+    PROJECT_DIR = EXE_DIR.parent.parent.parent
+
+else:
+    # clip_fast_api
+    PROJECT_DIR = Path(__file__).resolve().parent.parent.parent
+
+BASE_DIR = PROJECT_DIR
+
+MODELS_DIR = Path(
+    os.getenv(
+        "MODELS_DIR",
+        PROJECT_DIR / "models"
+    )
+)
+
+IMAGES_DIR = Path(
+    os.getenv(
+        "IMAGES_DIR",
+        PROJECT_DIR / "images"
+    )
+)
+
+EMBEDDINGS_DIR = Path(
+    os.getenv(
+        "EMBEDDINGS_DIR",
+        PROJECT_DIR / "clip_fast_api" / "data"
+    )
+)
 
 # =====================================================================
 # 3. GRAPH TARGETS & AUTO-DETECTION HYBRID
@@ -76,3 +101,14 @@ IMAGE_PATHS_LIST = EMBEDDINGS_DIR / "image_paths.json"
 # =====================================================================
 for directory in [MODELS_DIR, IMAGES_DIR, EMBEDDINGS_DIR]:
     directory.mkdir(parents=True, exist_ok=True)
+
+# 6. JEDNOSTKA CENTRALNA DLA BAZY DANYCH (Zapewnia stabilność lokalizacji)
+DB_PATH = EMBEDDINGS_DIR / "models.db"
+
+print("\n===== CONFIG =====")
+print("PROJECT_DIR :", PROJECT_DIR)
+print("MODELS_DIR  :", MODELS_DIR)
+print("DATA_DIR    :", EMBEDDINGS_DIR)
+print("DB_PATH     :", DB_PATH)
+print("DB_EXISTS   :", DB_PATH.exists())
+print("==================\n")

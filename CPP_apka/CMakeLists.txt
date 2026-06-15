@@ -1,6 +1,9 @@
 cmake_minimum_required(VERSION 3.20)
 project(TestBackend)
 
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
 # Use FetchContent to automatically download and build libcurl
 include(FetchContent)
 set(BUILD_CURL_EXE OFF CACHE BOOL "" FORCE)

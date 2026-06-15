@@ -75,6 +75,7 @@ test_image.jpg
 *.onnx
 *.safetensors
 *.bin
+*.csv
 
 # Logi
 *.log
@@ -89,3 +90,7 @@ logs/
 .ipynb_checkpoints/
 
 clip_model_api/
+
+# Generated runtime data
+clip_fast_api/data/
+clip_fast_api/log.txt

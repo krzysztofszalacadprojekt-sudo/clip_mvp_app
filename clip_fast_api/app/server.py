@@ -1,11 +1,9 @@
-import sys
 import os
 import time
 from pathlib import Path
 from typing import List
 
 import uvicorn
-import numpy as np
 import onnxruntime as ort
 from fastapi import FastAPI, HTTPException, UploadFile, File, Request
 from fastapi.responses import JSONResponse
@@ -22,7 +20,9 @@ from .embedding_store import (
     load_index_and_paths,
     search_similar_images,
     update_embeddings,
+    update_embeddings_from_db,
 )
+from .config import MODELS_DIR, EMBEDDINGS_DIR, DB_PATH
 
 # Load environment variables from .env file
 load_dotenv()
@@ -94,6 +94,32 @@ async def lifespan(app: FastAPI):
             index = None
             image_paths = []
 
+        # ---------------------------
+        # STEP 3: BACKGROUND AUTOMATIC SYNC
+        # ---------------------------
+        from threading import Thread
+        from .embedding_store import update_embeddings_from_db  # Upewnij się, że ścieżka importu pasuje
+
+        def auto_sync_worker():
+            global index, image_paths
+            try:
+                print("🔍 [Background Sync] Checking SQLite for new models missing embeddings...")
+                sync_start = time.time()
+                
+                # Przetwarzanie bazy danych SigLIP-em w osobnym wątku
+                message = update_embeddings_from_db(DB_PATH)
+                print(f"ℹ️ [Background Sync] {message}")
+                
+                # Natychmiastowe załadowanie świeżo wygenerowanych wektorów do działającego RAM-u FastAPI
+                index, image_paths = load_index_and_paths()
+                print(f"🔄 [Background Sync] RAM Hot-reload complete in {time.time() - sync_start:.2f}s.")
+            except Exception as sync_err:
+                print(f"❌ [Background Sync Error] Auto-update failed: {sync_err}")
+
+        # Odpalamy pracownika w tle. daemon=True gwarantuje, że wątek zamknie się, gdy wyłączysz serwer.
+        sync_thread = Thread(target=auto_sync_worker, daemon=True)
+        sync_thread.start()
+
     except Exception as e:
         print(f"❌ FATAL INIT ERROR: {e}")
         traceback.print_exc()
@@ -103,7 +129,6 @@ async def lifespan(app: FastAPI):
     yield
 
     print("🛑 Server shutdown.")
-
 
 # --- APP INITIALIZATION ---
 app = FastAPI(lifespan=lifespan)
@@ -153,18 +178,25 @@ def create_embeddings_endpoint():
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/update-embeddings")
-def update_embeddings_endpoint(update_dirs: UpdateDirectories):
-    print(update_dirs.directories)
+def update_embeddings_endpoint():
+    print("📥 Odebrano żądanie aktualizacji embeddingów z bazy danych SQLite.")
     start_time = time.time()
     try:
-        message = update_embeddings(update_dirs.directories)
+        
+        # 2. Wywołujemy nową funkcję synchronizującą bazę z SigLIP 2 i FAISS
+        message = update_embeddings_from_db(DB_PATH)
+        
+        # 3. Krytyczne: Przeładowujemy indeks w pamięci RAM serwera FastAPI
         global index, image_paths
         index, image_paths = load_index_and_paths()
         
         elapsed = time.time() - start_time
         print(f"⏱️ Update embeddings completed in {elapsed:.2f} seconds.")
+        
         return JSONResponse(content={"message": f"{message} (Took {elapsed:.2f}s)"})
+        
     except Exception as e:
+        print(f"❌ Błąd podczas operacji update-embeddings: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # --- SEARCH ENDPOINTS ---
