@@ -2,7 +2,7 @@ import faiss
 import numpy as np
 import json
 from pathlib import Path
-from .config import FAISS_INDEX_PATH, IMAGE_PATHS_LIST, IMAGES_DIR
+from .config import IMAGES_DIR, FAISS_INDEX_PATH, IMAGE_PATHS_LIST, IMAGES_DIR
 from PIL import Image
 from typing import List
 import concurrent.futures
@@ -192,9 +192,11 @@ def create_and_save_embeddings(image_paths: List[str] = None):
         
 def load_index_and_paths():
     """
-    Ładuje indeks FAISS oraz listę ścieżek obrazów z dysku do pamięci RAM.
-    Wersja czysta: wczytuje dane w relacji 1:1 dokładnie tak, jak zostały zapisane.
+    Ładuje indeks FAISS oraz listę ścieżek z dysku do pamięci RAM.
+    Wersja produkcyjna: bezpieczna dla ścieżek względnych (bez .resolve())
     """
+    from .config import FAISS_INDEX_PATH, IMAGE_PATHS_LIST
+
     if not FAISS_INDEX_PATH.exists() or not IMAGE_PATHS_LIST.exists():
         return None, None
         
@@ -202,8 +204,7 @@ def load_index_and_paths():
     with open(IMAGE_PATHS_LIST, "r", encoding="utf-8") as f:
         image_paths = json.load(f)
 
-    # Spójna normalizacja ścieżek bez zmieniania długości tablicy!
-    normalized_paths = [str(Path(p).expanduser().resolve()) for p in image_paths]
+    normalized_paths = [p.replace("/", "\\").strip() for p in image_paths]
 
     return index, normalized_paths
 
@@ -232,12 +233,14 @@ def search_similar_images(query_embedding, index, image_paths, top_k=5):
                 
             # Defensywne sprawdzenie granic tablicy (Zabezpieczenie przed list index out of range)
             if 0 <= idx < len(image_paths):
-                results.append(
-                    {
-                        "path": image_paths[idx],
-                        "distance": float(distances[0][i])
-                    }
-                )
+                path_to_add = IMAGES_DIR / image_paths[idx]
+                if path_to_add.exists():
+                    results.append(
+                        {
+                            "path": str(path_to_add),
+                            "distance": float(distances[0][i])
+                        }
+                    )
             else:
                 print(f"⚠️ [Defensive Guard] FAISS zwrócił indeks {idx}, ale image_paths ma tylko {len(image_paths)} elementów! Pomijam.")
                 
@@ -404,20 +407,18 @@ def update_embeddings(directories: List[str]):
 
 def update_embeddings_from_db(db_path: str) -> str:
     """
-    Dwukierunkowa pętla uzgadniania stanu z obsługą relacji 1-do-wielu.
-    Grupuje modele po unikalnych ścieżkach plików graficznych, optymalizując
-    prace SigLIP 2 i eliminując duplikaty wektorów w bazie FAISS.
+    Lekka, produkcyjna pętla uzgadniania stanu dla ścieżek względnych.
+    Gwarantuje relację 1-do-wielu bez dublowania pracy SigLIP 2.
     """
-    print("\n=== SYSTEM SYNCHRONIZACJI Z AUTOMATYCZNYM GARBAGE COLLECTOREM V5 ===")
+    print("\n=== SYSTEM SYNCHRONIZACJI PRODUKCYJNEJ (Ścieżki Względne) ===")
     start_check = time.time()
     CHECKPOINT_SIZE = 1000
-    
-    # 1. Pobieramy aktualny stan z dysku
+
+    # 1. Odczyt aktualnego stanu relatywnego z dysku
     index, image_paths_list = load_index_and_paths()
     if image_paths_list is None:
         image_paths_list = []
-        
-    index_total_vectors = index.ntotal if index is not None else 0
+    existing_paths = set(image_paths_list)
 
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
@@ -430,84 +431,43 @@ def update_embeddings_from_db(db_path: str) -> str:
     try:
         cursor = conn.cursor()
         
-        # Pobieramy wszystkie ścieżki z bazy
+        # Pobieramy wszystkie ścieżki z bazy (które są już relatywne)
         cursor.execute("SELECT id, name, jpg_path, image_embedding_exists FROM models WHERE jpg_path IS NOT NULL")
         rows = cursor.fetchall()
 
         if not rows:
             return "Baza danych SQLite jest pusta."
 
-        # Grupowanie po unikalnych ścieżkach obrazów
+        # KROK A: Grupowanie po ścieżkach względnych z uwzględnieniem IMAGES_DIR
         with conn:
             for row in rows:
                 model_id = row["id"]
                 db_flag = row["image_embedding_exists"]
-                raw_path = row["jpg_path"].strip()
+                rel_path = row["jpg_path"].strip()
 
-                if raw_path.upper().startswith("C:"):
-                    remainder = raw_path[2:].lstrip(" \\")
-                    raw_path = "C:\\" + remainder
+                # Poprawka rozszerzenia, jeśli baza go nie miała
+                p_rel = Path(rel_path)
+                if not p_rel.suffix:
+                    p_rel = p_rel.with_suffix(".jpg")
+                    rel_path = str(p_rel)
 
-                p = Path(raw_path)
-                if not p.suffix:
-                    p = p.with_suffix(".jpg")
+                # 🚀 SPRAWDZENIE: Łączymy bazę klienta ze ścieżką względną
+                if (IMAGES_DIR / rel_path).exists():
+                    # 🎯 KLUCZEM w słowniku staje się unikalna ścieżka WZGLĘDNA
+                    if rel_path not in path_groups:
+                        path_groups[rel_path] = []
+                    path_groups[rel_path].append({"id": model_id, "flag": db_flag})
 
-                target_path = None
-                if p.exists():
-                    target_path = p
-                else:
-                    parent_dir = p.parent.parent
-                    fallback_path = parent_dir / p.name
-                    if parent_dir.exists() and fallback_path.exists():
-                        target_path = fallback_path
-                        new_path_str = str(fallback_path.resolve())
-                        cursor.execute("UPDATE models SET jpg_path = ? WHERE id = ?", (new_path_str, model_id))
-
-                if target_path:
-                    resolved_path_str = str(target_path.expanduser().resolve())
-                    if resolved_path_str not in path_groups:
-                        path_groups[resolved_path_str] = []
-                    path_groups[resolved_path_str].append({"id": model_id, "flag": db_flag})
-
-        # ---------------------------------------------------------------------
-        # 🚀 AUTOMATYCZNY GARBAGE COLLECTOR (SAMOCZYSZCZENIE)
-        # ---------------------------------------------------------------------
-        total_unique_db_images = len(path_groups)
         
-        # Jeśli FAISS ma więcej wektorów niż baza ma unikalnych zdjęć -> mamy duchy!
-        if index_total_vectors > total_unique_db_images:
-            ghost_count = index_total_vectors - total_unique_db_images
-            
-            # Próg aktywacji sprzątania: np. więcej niż 500 śmieci lub 5% całej bazy
-            if ghost_count > 500 or (ghost_count / total_unique_db_images) > 0.05:
-                print(f"🧹 [Garbage Collector] Wykryto {ghost_count} nieużywanych wektorów-duchów u klienta.")
-                print("🧹 [Garbage Collector] Uruchamiam automatyczne czyszczenie i optymalizację indeksu...")
+        normalized_existing = {p.lower() for p in image_paths_list}
                 
-                # Zamykamy/usuwamy stary indeks w pamięci RAM
-                index = None
-                image_paths_list = []
-                existing_paths = set()
-                
-                # Usuwamy pliki fizyczne z dysku, aby pętla zbudowała je na czysto
-                if FAISS_INDEX_PATH.exists(): FAISS_INDEX_PATH.unlink()
-                if IMAGE_PATHS_LIST.exists(): IMAGE_PATHS_LIST.unlink()
-                
-                # Resetujemy flagi w SQLite do zera, żeby pętla przemieliła wszystko prawidłowo
-                with conn:
-                    cursor.execute("UPDATE models SET image_embedding_exists = 0")
-                
-                print("🧹 [Garbage Collector] Pliki zresetowane. Rozpoczynam automatyczną re-indeksację...")
-            else:
-                # Duchów jest mało (np. kilka sztuk) - ignorujemy, nie ma sensu marnować czasu klienta
-                existing_paths = set(image_paths_list)
-        else:
-            existing_paths = set(image_paths_list)
-        # ---------------------------------------------------------------------
-
-        # KROK B: Dwukierunkowe uzgadnianie stanów (Reconciliation)
         with conn:
-            for resolved_path_str, models in path_groups.items():
-                is_in_faiss = resolved_path_str in existing_paths
+            for rel_path, models in path_groups.items():
+                # 2. Ścieżkę z bazy danych przed testem "in" traktujemy dokładnie tak samo
+                lookup_path = rel_path.lower()
+
+                # Teraz dopasowanie zadziała zawsze, niezależnie od formatu pliku
+                is_in_faiss = lookup_path in normalized_existing
                 
                 for m in models:
                     if is_in_faiss and m["flag"] == 0:
@@ -518,17 +478,17 @@ def update_embeddings_from_db(db_path: str) -> str:
                         healed_to_missing += 1
                 
                 if not is_in_faiss:
-                    images_to_embed.append(resolved_path_str)
+                    images_to_embed.append(rel_path)
 
         print(f"⏱️ Weryfikacja spójności unikalnych zasobów zakończona w {time.time() - start_check:.4f}s.")
         print(f"📊 Statystyki struktury: Wykryto {len(path_groups)} unikalnych zdjęć dla {len(rows)} modeli bazy.")
         
         if healed_to_exists > 0 or healed_to_missing > 0:
-            print(f"⚡ [Self-Healing] Dostrojono flagi relacji: oznaczono jako istniejące: {healed_to_exists}, zresetowano: {healed_to_missing}")
+            print(f"⚡ [Self-Healing] Dostrojono flagi: oznaczono jako istniejące: {healed_to_exists}, zresetowano: {healed_to_missing}")
 
         total_images_to_process = len(images_to_embed)
         if total_images_to_process == 0:
-            return "Wszystkie systemy są w harmonii. Indeks FAISS (Unikalny) i baza SQLite są idealnie zsynchronizowane."
+            return "Wszystkie systemy są w harmonii. Indeks FAISS (Względny) i baza SQLite są idealnie zsynchronizowane."
 
         print(f"🚀 Do faktycznego przetworzenia przez SigLIP 2 pozostało: {total_images_to_process} UNIKALNYCH obrazów.")
         print(f"💾 Punkty kontrolne (Checkpoints) zabezpieczą dysk co {CHECKPOINT_SIZE} zdjęć.")
@@ -542,43 +502,48 @@ def update_embeddings_from_db(db_path: str) -> str:
             
             print(f"\n📦 [Blok {current_block_num}/{total_blocks}] Przetwarzanie partii {len(chunk_paths)} unikalnych zdjęć...")
             
-            new_embeddings, valid_new_paths = embed_images_batch(chunk_paths)
+            # 🚀 KLUCZOWE: Budujemy ścieżki absolutne TYLKO dla modelu AI, żeby mógł otworzyć plik obrazu
+            absolute_chunk_paths = [str((IMAGES_DIR / p).resolve()) for p in chunk_paths]
             
-            if new_embeddings.shape[0] == 0 or not valid_new_paths:
+            new_embeddings, valid_absolute_paths = embed_images_batch(absolute_chunk_paths)
+            
+            if new_embeddings.shape[0] == 0 or not valid_absolute_paths:
                 continue
 
+            # 🚀 KLUCZOWE: Po powrocie z AI, obcinamy przedrostek z powrotem do formatu względnego dla pliku JSON
+            valid_relative_paths = [str(Path(p).relative_to(IMAGES_DIR)) for p in valid_absolute_paths]
+
             if index is None:
-                import faiss
                 index = faiss.IndexFlatIP(new_embeddings.shape[1])
             
             index.add(new_embeddings)
-            image_paths_list.extend(valid_new_paths)
+            image_paths_list.extend(valid_relative_paths)
 
             # Zapis indeksu .bin
             tmp_index = str(FAISS_INDEX_PATH) + ".tmp"
             faiss.write_index(index, tmp_index)
             os.replace(tmp_index, str(FAISS_INDEX_PATH))
             
-            # Zapis ścieżek .json
+            # Zapis ścieżek .json (Tylko czyste ścieżki względne!)
             tmp_json = str(IMAGE_PATHS_LIST) + ".tmp"
             with open(tmp_json, "w", encoding="utf-8") as f:
                 json.dump(image_paths_list, f, ensure_ascii=False, indent=2)
             os.replace(tmp_json, IMAGE_PATHS_LIST)
 
-            # MASOWA AKTUALIZACJA: Włączamy flagę '1' dla WSZYSTKICH modeli powiązanych z przetworzonymi ścieżkami
+            # Masowa aktualizacja flag '1' w SQLite dla wszystkich powiązanych modeli
             with conn:
-                for path in valid_new_paths:
-                    associated_models = path_groups.get(path, [])
+                for rel_path in valid_relative_paths:
+                    associated_models = path_groups.get(rel_path, [])
                     for m in associated_models:
                         cursor.execute("UPDATE models SET image_embedding_exists = 1 WHERE id = ?", (m["id"],))
 
-            checkpoint_count += len(valid_new_paths)
+            checkpoint_count += len(valid_relative_paths)
             print(f"🔒 [Checkpoint Zablokowany] Postęp zapisu unikalnych: {i + len(chunk_paths)} / {total_images_to_process}")
 
         return f"Synchronizacja udana. Przetworzono unikalnych obrazów: {checkpoint_count}."
 
     except sqlite3.Error as e:
-        print(f"❌ Krytyczny błąd bazy danych podczas pętli uzgadniania V4: {e}")
+        print(f"❌ Krytyczny błąd bazy danych podczas pętli produkcyjnej V5: {e}")
         raise
     finally:
         conn.close()

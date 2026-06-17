@@ -12,7 +12,6 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-# Konfiguracja logowania produkcyjnego
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -27,7 +26,6 @@ def create_database(db_path: str) -> None:
     jeśli one jeszcze nie istnieją.
     """
     db_file = Path(db_path)
-    # Upewnij się, że katalog docelowy istnieje
     db_file.parent.mkdir(parents=True, exist_ok=True)
 
     query_table = """

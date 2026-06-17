@@ -9,6 +9,8 @@
 #include <cstdlib>
 #include <filesystem>
 #include <windows.h> // Potrzebne do MultiByteToWideChar
+#include <algorithm>
+#include <cctype>
 
 namespace fs = std::filesystem;
 std::ofstream logFile;
@@ -20,6 +22,28 @@ void menu() {
     std::cout << "3. Search by image\n";
     std::cout << "0. Exit\n";
     std::cout << "Choose an option: ";
+}
+
+std::string safe_json_string(const std::string& input) {
+    printf("Debug: Original input string: '%s'\n", input.c_str());
+    std::string result;
+    for (unsigned char c : input) {
+        // 1. Wycinamy niebezpieczne znaki kontrolne ASCII (0-31) oraz bajt zerowy
+        if (c < 32) continue; 
+        
+        // 2. Eskapujemy cudzysłów (bo on może rozbić strukturę JSON)
+        if (c == '"') {
+            result += "\\\""; 
+        } 
+        // 3. 🚀 KOMPROMIS: Zamiast eskapować backslash, zamieniamy go na bezpieczną spację
+        else if (c == '\\') {
+            result += " "; // Bezpieczna separacja słów
+        } 
+        else {
+            result += c;
+        }
+    }
+    return result;
 }
 
 std::string console_to_utf8(const std::string& input) {
@@ -371,17 +395,30 @@ target_image=C:/Users/CAD/Desktop/clip_fast_api/images/sofa.jpg
                 std::string local_input;
                 std::cout << "Enter text search query (e.g., modern oak chair): ";
                 
-                // 1. Pobieramy surowy ciąg znaków z konsoli w lokalnym kodowaniu systemu
+                // 1. Pobieramy surowy ciąg znaków z konsoli
                 std::getline(std::cin, local_input);
                 
-                // 2. 🚀 KLUCZOWE: Tłumaczymy znaki terminala na czysty standard internetowy UTF-8
+                // 🛑 DEFENSYWNA BLOKADA: Sprawdzamy czy użytkownik wpisał cokolwiek poza spacjami
+                if (local_input.empty() || std::all_of(local_input.begin(), local_input.end(), [](unsigned char c) { return std::isspace(c); })) {
+                    std::cout << "⚠️ Search query cannot be empty!\n";
+                    break;
+                }
+                
+                // 2. Tłumaczymy znaki terminala na standard internetowy UTF-8
                 std::string search_query = console_to_utf8(local_input);
                 
-                // Wyświetlamy w konsoli informację diagnostyczną (używając wcout i wstring)
+                // 3. 🚀 KLUCZOWE: Sanityzacja i eskapowanie pod JSON (odcinamy " i \ oraz błędy bajtów)
+                std::string escaped_query = safe_json_string(search_query);
+                
+                // Diagnostyka lokalna (używa oryginalnego stringa do ładnego wyświetlenia)
                 std::wcout << L"Searching databases for: '" << utf8_to_wstring(search_query) << L"'...\n";
                 
-                // 3. Wysyłamy bezpieczny, poprawnie sformatowany JSON do FastAPI
-                std::string response = send_json_post(curl, base_url + "/find-similar-images-by-text", "{\"text\": \"" + search_query + "\", \"top_k\": " + top_k + "}");
+                // 4. Bezpieczne i stabilne złożenie payloadu JSON
+                // Używamy std::to_string(top_k), aby jawnie i bezpiecznie przekonwertować int na tekst
+                std::string json_payload = "{\"text\": \"" + escaped_query + "\", \"top_k\": " + top_k + "}";
+                
+                // 5. Wysyłka do FastAPI
+                std::string response = send_json_post(curl, base_url + "/find-similar-images-by-text", json_payload);
 
                 process_and_display_results(response);
                 break;

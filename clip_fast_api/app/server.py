@@ -2,16 +2,13 @@ import os
 import time
 from pathlib import Path
 from typing import List
-
 import uvicorn
 import onnxruntime as ort
 from fastapi import FastAPI, HTTPException, UploadFile, File, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from transformers import AutoTokenizer, AutoProcessor
-
 from dotenv import load_dotenv
-
 from .image_preprocessor import preprocess_image
 from .clip_model import get_text_embedding as get_clip_text_embedding, get_image_embedding
 from app import config
@@ -116,7 +113,6 @@ async def lifespan(app: FastAPI):
             except Exception as sync_err:
                 print(f"❌ [Background Sync Error] Auto-update failed: {sync_err}")
 
-        # Odpalamy pracownika w tle. daemon=True gwarantuje, że wątek zamknie się, gdy wyłączysz serwer.
         sync_thread = Thread(target=auto_sync_worker, daemon=True)
         sync_thread.start()
 
@@ -132,7 +128,7 @@ async def lifespan(app: FastAPI):
 
 # --- APP INITIALIZATION ---
 app = FastAPI(lifespan=lifespan)
-index, image_paths = None, None  # Global store for FAISS/Paths
+index, image_paths = None, None  
 
 
 # --- EMBEDDING ENDPOINTS ---
@@ -222,7 +218,7 @@ def find_similar_images_by_text(prompt: TextPrompt, request: Request):
 
         # Przygotowanie danych pod ONNX Runtime
         inputs = active_tokenizer(
-            prompt.text,
+            prompt.text.lower().strip(),
             return_tensors="np",
             padding="max_length",
             truncation=True,

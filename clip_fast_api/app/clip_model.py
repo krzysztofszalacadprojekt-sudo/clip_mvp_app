@@ -3,11 +3,9 @@ import numpy as np
 import onnxruntime as ort
 from . import config
 
-# Lokalne zmienne globalne dla sesji ONNX
-shared_session = None  # Aktywne tylko gdy config.IS_UNIFIED == True
-visual_session = None  # Aktywne w trybie rozdzielnym (CLIP)
-text_session = None    # Aktywne w trybie rozdzielnym (CLIP)
-
+shared_session = None  
+visual_session = None
+text_session = None  
 
 def _build_session(model_path):
     """
@@ -44,11 +42,6 @@ def _get_active_session(session_type: str):
             text_session = _build_session(config.TEXT_MODEL_PATH)
         return text_session
 
-
-# =====================================================================
-# PRZETWARZANIE OBRAZÓW (VISION PIPELINE)
-# =====================================================================
-
 def _run_vision_inference(pixel_data):
     session = _get_active_session("visual")
     onnx_inputs = {}
@@ -78,11 +71,6 @@ def get_image_embedding(pixel_values):
 def get_image_embeddings_batch(pixel_values_batch):
     """Generuje embeddingi dla paczki zdjęć (Batch processing)."""
     return _run_vision_inference(pixel_values_batch)
-
-
-# =====================================================================
-# PRZETWARZANIE TEKSTU (TEXT PIPELINE)
-# =====================================================================
 
 def get_text_embedding(inputs):
     """

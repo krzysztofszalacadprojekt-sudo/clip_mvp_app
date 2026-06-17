@@ -36,7 +36,7 @@ MODELS_DIR = Path(
 IMAGES_DIR = Path(
     os.getenv(
         "IMAGES_DIR",
-        PROJECT_DIR / "images"
+        "C:/CADProjekt/CAD Decor PRO v. 4.0.4v2"
     )
 )
 
@@ -102,7 +102,7 @@ IMAGE_PATHS_LIST = EMBEDDINGS_DIR / "image_paths.json"
 for directory in [MODELS_DIR, IMAGES_DIR, EMBEDDINGS_DIR]:
     directory.mkdir(parents=True, exist_ok=True)
 
-# 6. JEDNOSTKA CENTRALNA DLA BAZY DANYCH (Zapewnia stabilność lokalizacji)
+# 6. Database path for SQLite storage of embeddings and metadata
 DB_PATH = EMBEDDINGS_DIR / "models.db"
 
 print("\n===== CONFIG =====")
