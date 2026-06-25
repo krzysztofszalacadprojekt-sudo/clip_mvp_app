@@ -1,0 +1,2114 @@
+diff --git a/CPP_apka/main.cpp b/CPP_apka/main.cpp
+index d0b89f7..2b3f0fc 100644
+--- a/CPP_apka/main.cpp
++++ b/CPP_apka/main.cpp
+@@ -11,6 +11,8 @@
+ #include <windows.h> // Potrzebne do MultiByteToWideChar
+ #include <algorithm>
+ #include <cctype>
++#include <thread>
++#include <sqlite3.h>
+ 
+ namespace fs = std::filesystem;
+ std::ofstream logFile;
+@@ -18,46 +20,125 @@ std::ofstream logFile;
+ void menu() {
+     std::cout << "\n==== Menu ====\n";
+     std::cout << "1. Update embeddings\n";
+-    std::cout << "2. Search by text\n";
++    std::cout << "2. Search by text (Hybrid Multimodal)\n"; // 🚀 Zaktualizowany opis opcji
+     std::cout << "3. Search by image\n";
++    std::cout << "4. Add new model\n";
++    std::cout << "5. Delete model manually\n";
+     std::cout << "0. Exit\n";
+     std::cout << "Choose an option: ";
+ }
+ 
++size_t WriteCallback(void* contents, size_t size, size_t nmemb, std::string* s);
++
++void TriggerBackendSync(const std::string& base_url)
++{
++    std::thread([base_url]() {
++        CURL* curl = curl_easy_init();
++        if (curl) {
++            std::string url = base_url + "/sync";
++            std::string response;
++
++            curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
++            curl_easy_setopt(curl, CURLOPT_POST, 1L);
++            curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, 0L); 
++            curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
++            curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
++            curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5L);
++
++            CURLcode res = curl_easy_perform(curl);
++            if (res == CURLE_OK) {
++                std::cout << "\n📦 [Background Sync] FAISS rebuild triggered successfully.\n";
++            }
++            curl_easy_cleanup(curl);
++        }
++    }).detach();
++}
++
++bool DeleteModelFromDB(sqlite3* db, const std::string& dwx_path, const std::string& base_url)
++{
++    const char* sql = "DELETE FROM models WHERE dwx_path = ?;";
++    sqlite3_stmt* stmt;
++
++    if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
++        std::cerr << "❌ SQL Error (prepare): " << sqlite3_errmsg(db) << "\n";
++        return false;
++    }
++
++    sqlite3_bind_text(stmt, 1, dwx_path.c_str(), -1, SQLITE_TRANSIENT);
++
++    bool success = false;
++    
++    if (sqlite3_step(stmt) == SQLITE_DONE) {
++        int rowsAffected = sqlite3_changes(db);
++        if (rowsAffected > 0) {
++            std::cout << "💥 Model removed from SQLite successfully.\n";
++            TriggerBackendSync(base_url);
++            success = true;
++        } else {
++            std::cout << "⚠️ No model found with given path: " << dwx_path << "\n";
++        }
++    } else {
++        std::cerr << "❌ SQL Error (execute): " << sqlite3_errmsg(db) << "\n";
++    }
++
++    sqlite3_finalize(stmt);
++    return success;
++}
++
++bool AddNewModelToDB(sqlite3* db, 
++                     const std::string& name, 
++                     const std::string& manufacturer, 
++                     const std::string& dwx_path, 
++                     const std::string& jpg_path,
++                     const std::string& base_url)
++{
++    const char* sql = "INSERT OR REPLACE INTO models (name, manufacturer, dwx_path, jpg_path, image_embedding_exists, text_embedding_exists, grupa, typ, typ_standardowy, opis_produktu) "
++                      "VALUES (?, ?, ?, ?, 0, 0, '', '', '', '');";
++    sqlite3_stmt* stmt;
++
++    if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
++        std::cerr << "❌ SQL Error (prepare): " << sqlite3_errmsg(db) << "\n";
++        return false;
++    }
++
++    sqlite3_bind_text(stmt, 1, name.c_str(), -1, SQLITE_TRANSIENT);
++    sqlite3_bind_text(stmt, 2, manufacturer.c_str(), -1, SQLITE_TRANSIENT);
++    sqlite3_bind_text(stmt, 3, dwx_path.c_str(), -1, SQLITE_TRANSIENT);
++    sqlite3_bind_text(stmt, 4, jpg_path.c_str(), -1, SQLITE_TRANSIENT);
++
++    bool success = false;
++
++    if (sqlite3_step(stmt) == SQLITE_DONE) {
++        std::cout << "✨ New model injected into SQLite.\n";
++        TriggerBackendSync(base_url);
++        success = true;
++    } else {
++        std::cerr << "❌ SQL Error (execute): " << sqlite3_errmsg(db) << "\n";
++    }
++
++    sqlite3_finalize(stmt);
++    return success;
++}
++
+ std::string safe_json_string(const std::string& input) {
+-    printf("Debug: Original input string: '%s'\n", input.c_str());
+     std::string result;
+     for (unsigned char c : input) {
+-        // 1. Wycinamy niebezpieczne znaki kontrolne ASCII (0-31) oraz bajt zerowy
+-        if (c < 32) continue; 
+-        
+-        // 2. Eskapujemy cudzysłów (bo on może rozbić strukturę JSON)
+-        if (c == '"') {
+-            result += "\\\""; 
+-        } 
+-        // 3. 🚀 KOMPROMIS: Zamiast eskapować backslash, zamieniamy go na bezpieczną spację
+-        else if (c == '\\') {
+-            result += " "; // Bezpieczna separacja słów
+-        } 
+-        else {
+-            result += c;
+-        }
++        if (c < 32) { result += " "; } 
++        else if (c == '"') { result += "\\\""; } 
++        else if (c == '\\') { result += " "; } 
++        else { result += c; }
+     }
+     return result;
+ }
+ 
+ std::string console_to_utf8(const std::string& input) {
+     if (input.empty()) return "";
+-    
+-    // 1. Pobieramy aktualną stronę kodową wejścia terminala klienta (np. 852)
+     UINT current_cp = GetConsoleCP();
+     
+-    // Krok A: Konwersja lokalnego kodowania konsoli -> UTF-16 (wstring)
+     int wlen = MultiByteToWideChar(current_cp, 0, input.c_str(), (int)input.length(), NULL, 0);
+     std::wstring wstr(wlen, 0);
+     MultiByteToWideChar(current_cp, 0, input.c_str(), (int)input.length(), &wstr[0], wlen);
+     
+-    // Krok B: Konwersja UTF-16 (wstring) -> Czysty, uniwersalny UTF-8 (string)
+     int u8len = WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), (int)wstr.length(), NULL, 0, NULL, NULL);
+     std::string u8str(u8len, 0);
+     WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), (int)wstr.length(), &u8str[0], u8len, NULL, NULL);
+@@ -65,7 +146,6 @@ std::string console_to_utf8(const std::string& input) {
+     return u8str;
+ }
+ 
+-// Pomocnicza funkcja konwertująca UTF-8 string na Windowsowy wstring
+ std::wstring utf8_to_wstring(const std::string& str) {
+     if (str.empty()) return L"";
+     int size_needed = MultiByteToWideChar(CP_UTF8, 0, &str[0], (int)str.size(), NULL, 0);
+@@ -77,7 +157,6 @@ std::wstring utf8_to_wstring(const std::string& str) {
+ void process_and_display_results(const std::string& raw_json_response) {
+     std::cout << "\nProcessing search results using native C++ filesystem...\n";
+     
+-    // Czyszczenie i tworzenie folderu w bezpieczny sposób przez bibliotekę C++
+     fs::path target_dir("search_results");
+     fs::remove_all(target_dir);
+     fs::create_directories(target_dir);
+@@ -95,7 +174,6 @@ void process_and_display_results(const std::string& raw_json_response) {
+         if (start_quote != std::string::npos && end_quote != std::string::npos) {
+             std::string source_path = raw_json_response.substr(start_quote + 1, end_quote - start_quote - 1);
+             
+-            // Naprawa podwójnych backslashy (\\ -> \) z JSON-a
+             std::string clean_path = "";
+             for (size_t i = 0; i < source_path.length(); ++i) {
+                 if (source_path[i] == '\\' && i + 1 < source_path.length() && source_path[i+1] == '\\') {
+@@ -107,7 +185,6 @@ void process_and_display_results(const std::string& raw_json_response) {
+             }
+             if (clean_path.empty()) clean_path = source_path;
+ 
+-            // Konwersja na bezpieczne ścieżki Windows (Wide-char) z pełną obsługą polskich liter
+             std::wstring w_clean_path = utf8_to_wstring(clean_path);
+             fs::path src_file(w_clean_path);
+ 
+@@ -169,13 +246,8 @@ size_t WriteCallback(void* contents, size_t size, size_t nmemb, std::string* s)
+ {
+     size_t totalSize = size * nmemb;
+     std::string data((char*)contents, totalSize);
+-
+     s->append(data);
+-
+-    if (logFile.is_open()) {
+-        logFile << data << std::endl;
+-    }
+-
++    if (logFile.is_open()) { logFile << data << std::endl; }
+     return totalSize;
+ }
+ 
+@@ -183,23 +255,12 @@ std::string escape_json_string(const std::string& input)
+ {
+     std::string output;
+     output.reserve(input.size());
+-
+     for (char c : input)
+     {
+-        if (c == '\\')
+-        {
+-            output += "\\\\";
+-        }
+-        else if (c == '"')
+-        {
+-            output += "\\\"";
+-        }
+-        else
+-        {
+-            output += c;
+-        }
++        if (c == '\\') { output += "\\\\"; }
++        else if (c == '"') { output += "\\\""; }
++        else { output += c; }
+     }
+-
+     return output;
+ }
+ 
+@@ -207,32 +268,23 @@ std::string build_directories_json(const std::string& dirs)
+ {
+     std::stringstream ss(dirs);
+     std::string dir;
+-
+     std::string json = "{\"directories\":[";
+-
+     bool first = true;
+ 
+     while (std::getline(ss, dir, ';'))
+     {
+-        if (!first)
+-            json += ",";
+-
++        if (!first) json += ",";
+         json += "\"" + escape_json_string(dir) + "\"";
+-
+         first = false;
+     }
+ 
+     json += "]}";
+-
+     return json;
+ }
+ 
+ std::string send_json_post(CURL* curl, const std::string& url, const std::string& json_payload) {
+-
+     if (logFile.is_open()) {
+-        logFile << "\n==== REQUEST ====\n";
+-        logFile << url << "\n";
+-        logFile << json_payload << "\n";
++        logFile << "\n==== REQUEST ====\n" << url << "\n" << json_payload << "\n";
+     }
+ 
+     curl_easy_reset(curl); 
+@@ -245,17 +297,15 @@ std::string send_json_post(CURL* curl, const std::string& url, const std::string
+     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_payload.c_str());
+     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
+     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+-
+     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 300L);
+ 
+     CURLcode res = curl_easy_perform(curl);
+     if (res != CURLE_OK) {
+         std::cout << "Request failed (" << url << "): " << curl_easy_strerror(res) << "\n";
+     } else {
+-        std::cout << "Response from " << url << ":\n" << response << "\n";
++        std::cout << "Response received from server.\n";
+         if (logFile.is_open()) {
+-            logFile << "\n==== RESPONSE ====\n";
+-            logFile << response << "\n";
++            logFile << "\n==== RESPONSE ====\n" << response << "\n";
+         }
+     }
+     curl_slist_free_all(headers);
+@@ -265,28 +315,18 @@ std::string send_json_post(CURL* curl, const std::string& url, const std::string
+ std::string send_empty_post(CURL* curl, const std::string& url) {
+     curl_easy_reset(curl);
+     std::string response;
+-
+     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+     curl_easy_setopt(curl, CURLOPT_POST, 1L);
+     curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, 0L); 
+     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
+     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+-
+     CURLcode res = curl_easy_perform(curl);
+-    if (res != CURLE_OK) {
+-        std::wcout << L"Request failed (" << utf8_to_wstring(url) << L"): " << utf8_to_wstring(curl_easy_strerror(res)) << L"\n";
+-    } else {
+-        std::wcout << L"Response from " << utf8_to_wstring(url) << L":\n" << utf8_to_wstring(response) << L"\n";
+-    }
+     return response;
+ }
+ 
+ std::string send_multipart_post(CURL* curl, const std::string& url, const std::string& file_path, const std::string& top_k) {
+     if (logFile.is_open()) {
+-        logFile << "\n==== REQUEST (MULTIPART) ====\n";
+-        logFile << url << "\n";
+-        logFile << "file: " << file_path << "\n";
+-        logFile << "top_k: " << top_k << "\n";
++        logFile << "\n==== REQUEST (MULTIPART) ====\n" << url << "\nfile: " << file_path << "\ntop_k: " << top_k << "\n";
+     }
+ 
+     curl_easy_reset(curl);
+@@ -318,18 +358,13 @@ std::string send_multipart_post(CURL* curl, const std::string& url, const std::s
+     if (res != CURLE_OK) {
+         std::wcout << L"Request failed (" << utf8_to_wstring(url) << L"): " << utf8_to_wstring(curl_easy_strerror(res)) << L"\n";
+     } else {
+-        std::wcout << L"Response from " << utf8_to_wstring(url) << L":\n" << utf8_to_wstring(response) << L"\n";
+-        if (logFile.is_open()) {
+-            logFile << "\n==== RESPONSE ====\n";
+-            logFile << response << "\n";
+-        }
++        if (logFile.is_open()) { logFile << "\n==== RESPONSE ====\n" << response << "\n"; }
+     }
+     curl_mime_free(form);
+     return response;
+ }
+ 
+ int main() {
+-
+     curl_global_init(CURL_GLOBAL_DEFAULT);
+     CURL* curl = curl_easy_init();
+ 
+@@ -350,7 +385,10 @@ int main() {
+ top_k=5
+ directories=C:/Users/CAD/Desktop/clip_fast_api/images;
+ target_image=C:/Users/CAD/Desktop/clip_fast_api/images/sofa.jpg
+-)"; // <--- TUTAJ: Dodaliśmy domyślną ścieżkę do testowego zdjęcia
++New_model_name=Blat 1
++New_dwx_path=dodatki\akcesoria_kuchenne\blat_i
++New_jpg_path=dodatki\akcesoria_kuchenne\blat_i.jpg
++)";
+             create_config.close();
+         }
+     } else {
+@@ -360,7 +398,7 @@ target_image=C:/Users/CAD/Desktop/clip_fast_api/images/sofa.jpg
+     int choice = -1;
+ 
+     while (choice != 0) {
+-        menu(); // Upewnij się, że w funkcji menu() zmieniłeś opisy na 1, 2, 3, 0
++        menu();
+         if (!(std::cin >> choice)) {
+             std::cin.clear();
+             std::cin.ignore(10000, '\n');
+@@ -373,13 +411,13 @@ target_image=C:/Users/CAD/Desktop/clip_fast_api/images/sofa.jpg
+             break;
+         }
+ 
+-        // Pobieranie infrastruktury z pliku konfiguracyjnego na bieżąco
+         auto config = load_config(config_filename);
+         std::string base_url = config["base_url"];
+         std::string top_k = config["top_k"];
+         std::string directories = config["directories"];
++        fs::path db_path = "../../../clip_fast_api/data/models.db";
++        fs::path absolute_db_path = fs::absolute(db_path);
+ 
+-        // Czyszczenie bufora strumienia wejściowego przed użyciem std::getline
+         std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+ 
+         switch (choice) {
+@@ -392,71 +430,111 @@ target_image=C:/Users/CAD/Desktop/clip_fast_api/images/sofa.jpg
+             }
+ 
+             case 2: {
++                // 🚀 ROZBUDOWANA DIAGNOSTYKA I INTERFEJS CMD DLA ALFY (Wyszukiwanie Hybrydowe)
+                 std::string local_input;
+                 std::cout << "Enter text search query (e.g., modern oak chair): ";
+-                
+-                // 1. Pobieramy surowy ciąg znaków z konsoli
+                 std::getline(std::cin, local_input);
+                 
+-                // 🛑 DEFENSYWNA BLOKADA: Sprawdzamy czy użytkownik wpisał cokolwiek poza spacjami
+                 if (local_input.empty() || std::all_of(local_input.begin(), local_input.end(), [](unsigned char c) { return std::isspace(c); })) {
+                     std::cout << "⚠️ Search query cannot be empty!\n";
+                     break;
+                 }
++
++                // Pobieranie wartości alfa live z terminala CMD
++                std::cout << "Enter Alpha balance for Score Fusion [0.0 = 100% Text, 1.0 = 100% Image] (default: 0.35): ";
++                std::string alpha_input;
++                std::getline(std::cin, alpha_input);
+                 
+-                // 2. Tłumaczymy znaki terminala na standard internetowy UTF-8
++                double alpha = 0.35; // Sugerowany punkt startowy
++                if (!alpha_input.empty()) {
++                    try {
++                        double parsed = std::stod(alpha_input);
++                        if (parsed >= 0.0 && parsed <= 1.0) {
++                            alpha = parsed;
++                        } else {
++                            std::cout << "⚠️ Alpha out of range [0.0 - 1.0]. Using default 0.35\n";
++                        }
++                    } catch (...) {
++                        std::cout << "⚠️ Invalid input type. Using default 0.35\n";
++                    }
++                }
++
+                 std::string search_query = console_to_utf8(local_input);
+-                
+-                // 3. 🚀 KLUCZOWE: Sanityzacja i eskapowanie pod JSON (odcinamy " i \ oraz błędy bajtów)
+                 std::string escaped_query = safe_json_string(search_query);
+                 
+-                // Diagnostyka lokalna (używa oryginalnego stringa do ładnego wyświetlenia)
+-                std::wcout << L"Searching databases for: '" << utf8_to_wstring(search_query) << L"'...\n";
++                std::wcout << L"Executing Hybrid Lookup for: '" << utf8_to_wstring(search_query) << L"' with Alpha = " << alpha << L"...\n";
+                 
+-                // 4. Bezpieczne i stabilne złożenie payloadu JSON
+-                // Używamy std::to_string(top_k), aby jawnie i bezpiecznie przekonwertować int na tekst
+-                std::string json_payload = "{\"text\": \"" + escaped_query + "\", \"top_k\": " + top_k + "}";
++                // Budowa payloadu JSON uwzględniającego parametr alpha
++                std::string json_payload = "{\"text\": \"" + escaped_query + "\", \"top_k\": " + top_k + ", \"alpha\": " + std::to_string(alpha) + "}";
+                 
+-                // 5. Wysyłka do FastAPI
+-                std::string response = send_json_post(curl, base_url + "/find-similar-images-by-text", json_payload);
+-
++                // Wysyłamy żądanie do nowego, zunifikowanego endpointu hybrydowego
++                std::string response = send_json_post(curl, base_url + "/find-similar-images-by-hybrid-search", json_payload);
+                 process_and_display_results(response);
+                 break;
+             }
+ 
+             case 3: {
+-                //  Pobieramy ścieżkę bezpośrednio z pliku konfiguracyjnego
+                 std::string image_input = config["target_image"];
+-                
+                 if (image_input.empty()) {
+                     std::cout << "Error: 'target_image' is not defined in config.txt!\n";
+                     break;
+                 }
+                 
+                 std::cout << "Executing visual lookup for asset from config: '" << image_input << "'...\n";
+-                
+-                // Wysyłamy zapytanie do serwera FastAPI
+                 std::string response = send_multipart_post(curl, base_url + "/find-similar-images-by-image", image_input, top_k);
+-
+-                // Kopiujemy i otwieramy folder z wynikami
+                 process_and_display_results(response);
+                 break;
+             }
+ 
+-            // case 4: {
+-            //     std::string search_query = config["text"];
+-                
+-            //     std::cout << "Searching databases for: '" << search_query << "'...\n";
+-            //     std::string response = send_json_post(curl, base_url + "/find-similar-images-by-text", "{\"text\": \"" + search_query + "\", \"top_k\": " + top_k + "}");
++            case 4: {
++                std::string name, dwx_path, jpg_path, manufacturer = "Unknown";
++                std::cout << "\n--- Add New Model ---\n";
+ 
+-            //     process_and_display_results(response);
+-            //     break;
+-            // }
++                name = config["New_model_name"];
++                dwx_path = config["New_dwx_path"];
++                jpg_path = config["New_jpg_path"];
++
++                if (dwx_path.empty() || name.empty()) {
++                    std::cout << "⚠️ Error: Name and DWX Path cannot be empty!\n";
++                    break;
++                }
++
++                sqlite3* db = nullptr;
++                if (sqlite3_open(absolute_db_path.string().c_str(), &db) == SQLITE_OK) {
++                    AddNewModelToDB(db, name, manufacturer, dwx_path, jpg_path, base_url);
++                    sqlite3_close(db);
++                    std::cout << "🚀 Add operation complete. Database connection released.\n";
++                } else {
++                    std::cerr << "❌ Cannot open database: " << sqlite3_errmsg(db) << "\n";
++                }
++                break;
++            }
++
++            case 5: {
++                std::string dwx_path_to_delete;
++                std::cout << "\n--- Delete Model Manually ---\n";
++                std::cout << "Enter the exact (.dwx) path of the model to remove: ";
++                std::getline(std::cin, dwx_path_to_delete);
++
++                if (dwx_path_to_delete.empty()) {
++                    std::cout << "⚠️ Error: Path cannot be empty!\n";
++                    break;
++                }
++
++                sqlite3* db = nullptr;
++                if (sqlite3_open(absolute_db_path.string().c_str(), &db) == SQLITE_OK) {
++                    DeleteModelFromDB(db, dwx_path_to_delete, base_url);
++                    sqlite3_close(db);
++                    std::cout << "🚀 Delete operation complete. Database connection released.\n";
++                } else {
++                    std::cerr << "❌ Cannot open database: " << sqlite3_errmsg(db) << "\n";
++                }
++                break;
++            }
+ 
+             default:
+                 std::cout << "Invalid choice. Try again.\n";
+         }
+-        
+         std::cout << "\n----------------------------------------\n";
+     }
+ 
+diff --git a/clip_fast_api/app/config.py b/clip_fast_api/app/config.py
+index c43ac55..a69eb9d 100644
+--- a/clip_fast_api/app/config.py
++++ b/clip_fast_api/app/config.py
+@@ -33,12 +33,7 @@ MODELS_DIR = Path(
+     )
+ )
+ 
+-IMAGES_DIR = Path(
+-    os.getenv(
+-        "IMAGES_DIR",
+-        "C:/CADProjekt/CAD Decor PRO v. 4.0.4v2"
+-    )
+-)
++IMAGES_DIR = PROJECT_DIR.parent
+ 
+ EMBEDDINGS_DIR = Path(
+     os.getenv(
+@@ -95,7 +90,6 @@ except Exception:
+ FAISS_INDEX_PATH = EMBEDDINGS_DIR / "faiss_index.bin"
+ IMAGE_PATHS_LIST = EMBEDDINGS_DIR / "image_paths.json"
+ 
+-
+ # =====================================================================
+ # 5. ENVIRONMENT SELF-HEALING
+ # =====================================================================
+@@ -105,10 +99,15 @@ for directory in [MODELS_DIR, IMAGES_DIR, EMBEDDINGS_DIR]:
+ # 6. Database path for SQLite storage of embeddings and metadata
+ DB_PATH = EMBEDDINGS_DIR / "models.db"
+ 
++# IMAGES_DIR / \paczka_mvp\search_client\build\Release
++CPP_APP_DIR = IMAGES_DIR / "paczka_mvp" / "search_client" / "build" / "Release"
++
+ print("\n===== CONFIG =====")
++print("CAD DECOR DIR :", IMAGES_DIR)
+ print("PROJECT_DIR :", PROJECT_DIR)
+ print("MODELS_DIR  :", MODELS_DIR)
+ print("DATA_DIR    :", EMBEDDINGS_DIR)
+ print("DB_PATH     :", DB_PATH)
+ print("DB_EXISTS   :", DB_PATH.exists())
++print("CPP_APP_DIR :", CPP_APP_DIR)
+ print("==================\n")
+\ No newline at end of file
+diff --git a/clip_fast_api/app/database_manager.py b/clip_fast_api/app/database_manager.py
+index 56dc0b2..1baa6b5 100644
+--- a/clip_fast_api/app/database_manager.py
++++ b/clip_fast_api/app/database_manager.py
+@@ -2,6 +2,7 @@
+ """
+ Moduł zarządzania lokalną bazą danych SQLite dla systemu wyszukiwania modeli 3D.
+ Kompatybilny z systemem Windows, używa ścieżek relatywnych/absolutnych przez pathlib.
++Wzbogacony o trwały magazyn wektorów (embeddings) dla obrazów i tekstu.
+ """
+ 
+ import csv
+@@ -28,19 +29,22 @@ def create_database(db_path: str) -> None:
+     db_file = Path(db_path)
+     db_file.parent.mkdir(parents=True, exist_ok=True)
+ 
++    # 1. ZAKTUALIZOWANA STRUKTURA: Dodano nowe kolumny tekstowe z CSV
+     query_table = """
+     CREATE TABLE IF NOT EXISTS models (
+         id INTEGER PRIMARY KEY AUTOINCREMENT,
+         name TEXT,
+         manufacturer TEXT,
+-        category TEXT,
++        opis_produktu TEXT,
++        grupa TEXT,
++        typ TEXT,
++        typ_standardowy TEXT,
+         jpg_path TEXT,
+         dwx_path TEXT UNIQUE,
+-        width_mm INTEGER,
+-        depth_mm INTEGER,
+-        height_mm INTEGER,
+         image_embedding_exists INTEGER DEFAULT 0,
+         text_embedding_exists INTEGER DEFAULT 0,
++        image_vector TEXT,  -- Trwały cache wektora obrazu (Zserializowany JSON string)
++        text_vector TEXT,   -- Trwały cache wektora tekstu (Zserializowany JSON string)
+         last_modified TEXT
+     );
+     """
+@@ -49,7 +53,6 @@ def create_database(db_path: str) -> None:
+     indexes = [
+         "CREATE INDEX IF NOT EXISTS idx_models_dwx_path ON models(dwx_path);",
+         "CREATE INDEX IF NOT EXISTS idx_models_manufacturer ON models(manufacturer);",
+-        "CREATE INDEX IF NOT EXISTS idx_models_category ON models(category);",
+     ]
+ 
+     conn = sqlite3.connect(str(db_file))
+@@ -69,22 +72,24 @@ def create_database(db_path: str) -> None:
+ def _execute_upsert(cursor: sqlite3.Cursor, model_data: Dict[str, Any]) -> None:
+     """
+     Wewnętrzna funkcja pomocnicza realizująca zapytanie UPSERT na otwartym kursorze.
++    Bezpiecznie dba o to, by nie wyczyścić istniejących wektorów przy braku danych wejściowych.
+     """
+     now_iso = datetime.datetime.now().isoformat()
+ 
+-    # Przygotowanie pełnego słownika danych z wartościami domyślnymi
++    # 2. MAPOWANIE SŁOWNIKA: Przekazujemy nowe kolumny z zachowaniem spójnego snake_case
+     full_data = {
+-        "id": model_data.get("id"),
+         "name": model_data.get("name"),
+         "manufacturer": model_data.get("manufacturer"),
+-        "category": model_data.get("category"),
++        "opis_produktu": model_data.get("opis_produktu"),
++        "grupa": model_data.get("grupa"),
++        "typ": model_data.get("typ"),
++        "typ_standardowy": model_data.get("typ_standardowy"),
+         "jpg_path": model_data.get("jpg_path"),
+         "dwx_path": model_data.get("dwx_path"),
+-        "width_mm": model_data.get("width_mm"),
+-        "depth_mm": model_data.get("depth_mm"),
+-        "height_mm": model_data.get("height_mm"),
+-        "image_embedding_exists": model_data.get("image_embedding_exists", 0),
+-        "text_embedding_exists": model_data.get("text_embedding_exists", 0),
++        "image_embedding_exists": model_data.get("image_embedding_exists"),
++        "text_embedding_exists": model_data.get("text_embedding_exists"),
++        "image_vector": model_data.get("image_vector"),
++        "text_vector": model_data.get("text_vector"),
+         "last_modified": model_data.get("last_modified", now_iso),
+     }
+ 
+@@ -92,25 +97,30 @@ def _execute_upsert(cursor: sqlite3.Cursor, model_data: Dict[str, Any]) -> None:
+         logger.warning("Pominięto rekord: brak kluczowej wartości 'dwx_path'.")
+         return
+ 
++    # 3. ZAKTUALIZOWANA KWERENDA SQL: Dodano obsługę nowych pól w sekcjach INSERT oraz DO UPDATE
+     query = """
+     INSERT INTO models (
+-        id, name, manufacturer, category, jpg_path, dwx_path,
+-        width_mm, depth_mm, height_mm, image_embedding_exists,
+-        text_embedding_exists, last_modified
++        name, manufacturer, opis_produktu, grupa, typ, typ_standardowy,
++        jpg_path, dwx_path, image_embedding_exists,
++        text_embedding_exists, image_vector, text_vector, last_modified
+     ) VALUES (
+-        :id, :name, :manufacturer, :category, :jpg_path, :dwx_path,
+-        :width_mm, :depth_mm, :height_mm, :image_embedding_exists,
+-        :text_embedding_exists, :last_modified
++        :name, :manufacturer, :opis_produktu, :grupa, :typ, :typ_standardowy,
++        :jpg_path, :dwx_path,
++        COALESCE(:image_embedding_exists, 0), 
++        COALESCE(:text_embedding_exists, 0), 
++        :image_vector, :text_vector, :last_modified
+     ) ON CONFLICT(dwx_path) DO UPDATE SET
+         name = COALESCE(:name, name),
+         manufacturer = COALESCE(:manufacturer, manufacturer),
+-        category = COALESCE(:category, category),
++        opis_produktu = COALESCE(:opis_produktu, opis_produktu),
++        grupa = COALESCE(:grupa, grupa),
++        typ = COALESCE(:typ, typ),
++        typ_standardowy = COALESCE(:typ_standardowy, typ_standardowy),
+         jpg_path = COALESCE(:jpg_path, jpg_path),
+-        width_mm = COALESCE(:width_mm, width_mm),
+-        depth_mm = COALESCE(:depth_mm, depth_mm),
+-        height_mm = COALESCE(:height_mm, height_mm),
+         image_embedding_exists = COALESCE(:image_embedding_exists, image_embedding_exists),
+         text_embedding_exists = COALESCE(:text_embedding_exists, text_embedding_exists),
++        image_vector = COALESCE(:image_vector, image_vector),
++        text_vector = COALESCE(:text_vector, text_vector),
+         last_modified = :last_modified;
+     """
+     cursor.execute(query, full_data)
+@@ -146,7 +156,6 @@ def load_models_from_csv(csv_path: str, db_path: str) -> None:
+     try:
+         with conn:
+             cursor = conn.cursor()
+-            # Otwarcie pliku z uwzględnieniem kodowania UTF-8 i Windows newline
+             with open(csv_file, mode="r", encoding="utf-8", newline="") as f:
+                 reader = csv.DictReader(f)
+ 
+@@ -154,22 +163,19 @@ def load_models_from_csv(csv_path: str, db_path: str) -> None:
+                     logger.warning(f"Plik CSV {csv_path} jest pusty lub uszkodzony.")
+                     return
+ 
+-                # Mapowanie nazw kolumn z CSV na klucze bazy danych
+                 for row in reader:
+-                    # Bezpieczna konwersja ID na int, jeśli istnieje
+-                    raw_id = row.get("ID")
+-                    model_id = int(raw_id) if raw_id and raw_id.isdigit() else None
+-
++                    # 4. ZGODNOŚĆ KLUCZY: Zamieniłem wielkie litery na czysty standard snake_case
+                     model_data = {
+-                        "id": model_id,
+                         "name": row.get("Nazwa"),
+-                        "manufacturer": row.get("Producent"),
+-                        "category": row.get("Kategoria"),
+                         "dwx_path": row.get("DWG"),
+                         "jpg_path": row.get("JPG"),
++                        "manufacturer": row.get("Producent"),
++                        "opis_produktu": row.get("Opis_Produktu"),
++                        "grupa": row.get("Grupa"),
++                        "typ": row.get("Typ"),
++                        "typ_standardowy": row.get("typ_standardowy"),
+                     }
+ 
+-                    # Oczyszczenie stringów z białych znaków (stripping)
+                     cleaned_data = {
+                         k: (v.strip() if isinstance(v, str) else v)
+                         for k, v in model_data.items()
+@@ -188,7 +194,7 @@ def load_models_from_csv(csv_path: str, db_path: str) -> None:
+ def get_models_missing_files(db_path: str) -> List[Dict[str, Any]]:
+     """
+     Weryfikuje fizyczną obecność plików na dysku (JPG i DWX).
+-    Automatycznie odcina zdublowane końcówki plików (np. '88378 88378' lub '88378\\n88378').
++    Automatycznie odcina zdublowane końcówki plików (np. '88378 88378').
+     """
+     conn = sqlite3.connect(db_path)
+     conn.row_factory = sqlite3.Row
+@@ -199,31 +205,24 @@ def get_models_missing_files(db_path: str) -> List[Dict[str, Any]]:
+         cursor.execute("SELECT id, name, jpg_path, dwx_path FROM models")
+         rows = cursor.fetchall()
+ 
+-        # Wewnętrzna funkcja naprawiająca błędy Windowsa oraz dublowanie nazw
+         def sanitize_and_fix_path(raw_path: Optional[str], default_ext: str) -> Optional[Path]:
+             if not raw_path:
+                 return None
+             
+-            # 1. Wstępne oczyszczenie z białych znaków na skrajach
+             p_str = raw_path.strip()
+             
+-            # 2. Naprawa struktury dysku C:
+             if p_str.upper().startswith("C:"):
+                 remainder = p_str[2:].lstrip(" \\")
+                 p_str = "C:\\" + remainder
+ 
+-            # 3. FIX NA ZDUBLOWANĄ KOŃCÓWKĘ (np. "88378 88378" lub "88378\n88378")
+             if "\\" in p_str:
+                 directory, filename_part = p_str.rsplit("\\", 1)
+-                # Rozbijamy końcówkę po jakichkolwiek białych znakach (spacja, nowa linia)
+                 tokens = filename_part.strip().split()
+                 
+-                # Jeśli wykryjemy dokładnie dwa takie same tokeny obok siebie
+                 if len(tokens) == 2 and tokens[0] == tokens[1]:
+-                    filename_part = tokens[0]  # Zostawiamy tylko jeden czysty numer
++                    filename_part = tokens[0]
+                     p_str = directory + "\\" + filename_part
+ 
+-            # 4. Budujemy właściwy obiekt Path i dodajemy rozszerzenie, jeśli go brak
+             p = Path(p_str)
+             if not p.suffix:
+                 p = p.with_suffix(default_ext)
+@@ -234,7 +233,6 @@ def get_models_missing_files(db_path: str) -> List[Dict[str, Any]]:
+             missing_jpg = False
+             missing_dwx = False
+ 
+-            # Walidacja JPG
+             clean_jpg = sanitize_and_fix_path(model["jpg_path"], ".jpg")
+             if clean_jpg:
+                 if not clean_jpg.exists():
+@@ -242,7 +240,6 @@ def get_models_missing_files(db_path: str) -> List[Dict[str, Any]]:
+             else:
+                 missing_jpg = True
+ 
+-            # Walidacja DWX/DWG
+             clean_dwx = sanitize_and_fix_path(model["dwx_path"], ".dwx")
+             if clean_dwx:
+                 path_as_is = clean_dwx
+@@ -271,10 +268,8 @@ def get_models_missing_files(db_path: str) -> List[Dict[str, Any]]:
+ 
+ def sync_database_with_filesystem(db_path: str) -> None:
+     """
+-    Skanuje bazę danych pod kątem brakujących plików.
+-    Jeśli plik nie istnieje w zdefiniowanej ścieżce, sprawdza katalog nadrzędny (parent).
+-    Jeśli plik tam jest -> aktualizuje ścieżkę w bazie danych SQLite.
+-    Jeśli nadal go nie ma -> wypisuje ostrzeżenie o braku.
++    Skanuje bazę danych pod kątem brakujących plików i automatycznie naprawia ścieżki
++    w katalogu nadrzędnym (parent directory), jeśli pliki tam istnieją.
+     """
+     missing_files = get_models_missing_files(db_path)
+ 
+@@ -285,40 +280,28 @@ def sync_database_with_filesystem(db_path: str) -> None:
+     conn = sqlite3.connect(db_path)
+     try:
+         cursor = conn.cursor()
+-        
+-        # Otwieramy jedną transakcję dla wszystkich ewentualnych aktualizacji ścieżek
+         with conn:
+             for item in missing_files:
+                 model_id = item["id"]
+                 model_name = item["name"]
+ 
+-                # -------------------------------------------------------------
+-                # REKURENCJA DLA JPG: Szukanie w katalogu nadrzędnym
+-                # -------------------------------------------------------------
+                 if item["missing_jpg"] and item["clean_jpg_obj"]:
+                     orig_path: Path = item["clean_jpg_obj"]
+-                    # orig_path.parent to obecny folder, .parent.parent to katalog wyżej
+                     parent_dir = orig_path.parent.parent 
+                     fallback_jpg_path = parent_dir / orig_path.name
+ 
+                     if parent_dir.exists() and fallback_jpg_path.exists():
+-                        # Sukces! Znaleziono plik wyżej. Aktualizujemy bazę.
+                         new_path_str = str(fallback_jpg_path.resolve())
+                         cursor.execute("UPDATE models SET jpg_path = ? WHERE id = ?", (new_path_str, model_id))
+-                        # logger.info(f"🔄 [Auto-Fix JPG] Model ID {model_id} ({model_name}): Przeniesiono ścieżkę poziom wyżej -> {new_path_str}")
+-                        item["missing_jpg"] = False  # Flaga wyczyszczona
++                        item["missing_jpg"] = False
+                     else:
+                         logger.warning(f"❌ [Brak pliku JPG] Model ID {model_id} ({model_name}): Nie znaleziono w {item['jpg_path']}")
+ 
+-                # -------------------------------------------------------------
+-                # REKURENCJA DLA DWX/DWG: Szukanie w katalogu nadrzędnym + fallback rozszerzeń
+-                # -------------------------------------------------------------
+                 if item["missing_dwx"] and item["clean_dwx_obj"]:
+                     orig_path: Path = item["clean_dwx_obj"]
+                     parent_dir = orig_path.parent.parent
+ 
+                     if parent_dir.exists():
+-                        # Przygotowujemy potencjalne warianty pliku w katalogu nadrzędnym
+                         fallback_as_is = parent_dir / orig_path.name
+                         fallback_as_dwx = parent_dir / orig_path.with_suffix(".dwx").name
+                         fallback_as_dwg = parent_dir / orig_path.with_suffix(".dwg").name
+@@ -332,11 +315,10 @@ def sync_database_with_filesystem(db_path: str) -> None:
+                             found_dwx_path = fallback_as_dwg
+ 
+                         if found_dwx_path:
+-                            # Sukces! Znaleziono plik modelowy CAD wyżej.
+                             new_path_str = str(found_dwx_path.resolve())
+                             cursor.execute("UPDATE models SET dwx_path = ? WHERE id = ?", (new_path_str, model_id))
+                             logger.info(f"🔄 [Auto-Fix DWX] Model ID {model_id} ({model_name}): Przeniesiono ścieżkę poziom wyżej -> {new_path_str}")
+-                            item["missing_dwx"] = False  # Flaga wyczyszczona
++                            item["missing_dwx"] = False
+                         else:
+                             logger.warning(f"❌ [Brak pliku CAD] Model ID {model_id} ({model_name}): Nie znaleziono w {item['dwx_path']}")
+                     else:
+@@ -346,68 +328,4 @@ def sync_database_with_filesystem(db_path: str) -> None:
+         logger.error(f"Błąd SQLite podczas automatycznej naprawy ścieżek: {e}")
+         raise
+     finally:
+-        conn.close()
+-
+-
+-# =====================================================================
+-# 🚀 PRZYKŁAD UŻYCIA (RUNNABLE)
+-# =====================================================================
+-if __name__ == "__main__":
+-    DB_NAME = "models.db"
+-    CSV_NAME = "test_models.csv"
+-
+-    print("--- 1. Inicjalizacja bazy danych ---")
+-    create_database(DB_NAME)
+-
+-    print("\n--- 2. Tworzenie syntetycznego pliku CSV do testów ---")
+-    # Generujemy tymczasowe pliki atrapy na dysku, by testy przeszły pomyślnie
+-    Path("assets/images").mkdir(parents=True, exist_ok=True)
+-    Path("assets/cad").mkdir(parents=True, exist_ok=True)
+-    
+-    dummy_jpg = Path("assets/images/sofa_modern.jpg")
+-    dummy_dwg = Path("assets/cad/sofa_modern.dwg")
+-    dummy_jpg.touch(exist_ok=True)
+-    dummy_dwg.touch(exist_ok=True)
+-
+-    with open(CSV_NAME, mode="w", encoding="utf-8", newline="") as f:
+-        writer = csv.writer(f)
+-        # Nagłówki zgodne ze specyfikacją (w tym jedna losowa kolumna do testu odporności)
+-        writer.writerow(["ID", "Nazwa", "Producent", "Kategoria", "DWG", "JPG", "NieznanaKolumna"])
+-        writer.writerow(["1", "Sofa Modern", "Kler", "Meble Tapicerowane", str(dummy_dwg), str(dummy_jpg), "ignoruj"])
+-        writer.writerow(["2", "Krzesło Loft", "IKEA", "Krzesła", "assets/cad/broken_path.dwg", "", "test"])
+-
+-    print("\n--- 3. Masowe ładowanie danych z pliku CSV ---")
+-    load_models_from_csv(CSV_NAME, DB_NAME)
+-
+-    print("\n--- 4. Pojedynczy Insert lub Update (Test mechanizmu Upsert) ---")
+-    # Aktualizujemy rekord dla 'Sofa Modern' podając wymiary oraz informację o embeddingu
+-    update_payload = {
+-        "name": "Sofa Modern - Premium Edition",
+-        "dwx_path": str(dummy_dwg),  # Ten sam dwx_path wymusi aktualizację zamiast nowego ID
+-        "manufacturer": "Kler",
+-        "category": "Meble Wysegmentowane",
+-        "width_mm": 2200,
+-        "depth_mm": 950,
+-        "height_mm": 850,
+-        "image_embedding_exists": 1,
+-    }
+-    insert_or_update_model(DB_NAME, update_payload)
+-
+-    print("\n--- 5. Pobieranie modeli bez embeddingów tekstowych/obrazowych ---")
+-    missing_embeddings = get_models_missing_embeddings(DB_NAME)
+-    print(f"Liczba modeli wymagających przetworzenia przez CLIP/SigLIP: {len(missing_embeddings)}")
+-    for item in missing_embeddings:
+-        print(f" - ID: {item['id']}, Nazwa: {item['name']}, Ścieżka CAD: {item['dwx_path']}")
+-
+-    print("\n--- 6. Synchronizacja i weryfikacja plików na dysku ---")
+-    sync_database_with_filesystem(DB_NAME)
+-
+-    print("\n--- 7. Sprzątanie plików testowych ---")
+-    # Usuwanie plików tymczasowych utworzonych na potrzeby prezentacji kodu
+-    if Path(DB_NAME).exists():
+-        os.remove(DB_NAME)
+-    if Path(CSV_NAME).exists():
+-        os.remove(CSV_NAME)
+-    dummy_jpg.unlink(missing_ok=True)
+-    dummy_dwg.unlink(missing_ok=True)
+-    print("Testy zakończone sukcesem. Wszystkie mechanizmy działają prawidłowo.")
+\ No newline at end of file
++        conn.close()
+\ No newline at end of file
+diff --git a/clip_fast_api/app/embedding_store.py b/clip_fast_api/app/embedding_store.py
+index 289d5d2..48e997f 100644
+--- a/clip_fast_api/app/embedding_store.py
++++ b/clip_fast_api/app/embedding_store.py
+@@ -2,7 +2,7 @@ import faiss
+ import numpy as np
+ import json
+ from pathlib import Path
+-from .config import IMAGES_DIR, FAISS_INDEX_PATH, IMAGE_PATHS_LIST, IMAGES_DIR
++from .config import IMAGES_DIR, FAISS_INDEX_PATH, IMAGE_PATHS_LIST
+ from PIL import Image
+ from typing import List
+ import concurrent.futures
+@@ -98,66 +98,120 @@ def _get_dynamic_batch_size():
+         print(f"Automatyczna detekcja zasobów nie powiodła się ({e}). Powrót do bezpiecznego bezpiecznika = 1.")
+         return 1
+ 
+-def embed_images_batch(image_paths: List[str]):
++def embed_images_batch(image_paths: List[str]) -> tuple[np.ndarray, List[str]]:
+     """
+-    Compute L2-normalized CLIP image embeddings for a list of image paths using batching.
+-    Returns a (N, D) numpy array and a list of valid paths.
++    Przetwarza paczkę ścieżek obrazów na embeddingi SigLIP 2 przez ONNX Runtime + DirectML.
++    Bezpiecznie zasila zunifikowane grafy makietami wejść tekstowych i celuje w węzeł wizualny.
+     """
++    
++    if not image_paths:
++        return np.empty((0, 768), dtype=np.float32), []
++
++    # Pobieramy instancje sesji (zakładamy, że serwer używa zunifikowanej aktywnej sesji)
++    # W server.py przypisaliśmy ją do app.state.text_session, upewnij się, że masz do niej dostęp
++    # Może to być też wspólna zmienna globalna shared_session z clip_model
++    from .clip_model import _get_active_session
++    session = _get_active_session("visual") 
++
++    expected_inputs = [node.name for node in session.get_inputs()]
++    expected_outputs = [node.name for node in session.get_outputs()]
++
++    if "image_embeds" in expected_outputs:
++        target_output = "image_embeds"
++    else:
++        target_output = expected_outputs[0]
++        for output_name in expected_outputs:
++            name_lower = output_name.lower()
++            if (
++                ("embed" in name_lower or "feature" in name_lower)
++                and ("image" in name_lower or "vision" in name_lower)
++            ):
++                target_output = output_name
++                break
++
++    batch_size = max(1, min(_get_dynamic_batch_size(), 32))
+     feats = []
+     valid_paths = []
+ 
+-    batch_size = _get_dynamic_batch_size()
+-    total_images = len(image_paths)
+-    processed_images = 0
+-    print(f"Starting to process {total_images} images in batches of up to {batch_size}...")
++    def run_small_batch(batch_paths: List[str]) -> tuple[np.ndarray, List[str]]:
++        batch_imgs = []
++        batch_valid_paths = []
+ 
+-    def load_image(p):
+-        try:
+-            # 'with' ensures file handles are closed eagerly. 
+-            # 'convert' forces the pixel data to be fully loaded into memory.
+-            with Image.open(p) as img:
+-                img_rgb = img.convert("RGB")
+-            return p, img_rgb, str(Path(p).expanduser().resolve())
+-        except Exception as e:
+-            print(f"Skipping {p}: {e}")
+-            return p, None, None
++        for p in batch_paths:
++            try:
++                if not Path(p).exists():
++                    continue
+ 
+-    image_preprocessor._init_processor()
++                with Image.open(p) as img:
++                    batch_imgs.append(img.convert("RGB"))
++                batch_valid_paths.append(str(p))
++            except Exception as img_err:
++                print(f"Nie można wczytać obrazu {p}: {img_err}")
+ 
+-    # Process chunks one by one so we don't load thousands of images into RAM at once
+-    for i in range(0, len(image_paths), batch_size):
+-        chunk_paths = image_paths[i : i + batch_size]
+-        batch_imgs = []
+-        batch_valid_paths = []
++        if not batch_imgs:
++            return np.empty((0, 768), dtype=np.float32), []
++
++        if image_preprocessor.processor is None:
++            image_preprocessor._init_processor()
+ 
+-        # Load only the current batch of images using threads
+-        with concurrent.futures.ThreadPoolExecutor() as executor:
+-            for p, img, resolved_path in executor.map(load_image, chunk_paths):
+-                if img is not None:
+-                    batch_imgs.append(img)
+-                    batch_valid_paths.append(resolved_path)
+-
+-        if batch_imgs:
+-            inputs = image_preprocessor.processor(images=batch_imgs, return_tensors="np")
+-            image_features = get_image_embeddings_batch(inputs["pixel_values"])
+-            faiss.normalize_L2(image_features)
++        inputs = image_preprocessor.processor(images=batch_imgs, return_tensors="np")
++
++        onnx_inputs = {
++            "pixel_values": inputs["pixel_values"].astype(np.float32)
++        }
++
++        if "input_ids" in expected_inputs:
++            onnx_inputs["input_ids"] = np.zeros((len(batch_valid_paths), 64), dtype=np.int64)
+             
+-            feats.append(image_features)
++        if "attention_mask" in expected_inputs:
++            onnx_inputs["attention_mask"] = np.ones((len(batch_valid_paths), 64), dtype=np.int64)
++
++        raw_outputs = session.run([target_output], onnx_inputs)
++        image_features = raw_outputs[0]
++
++        if image_features.ndim == 2 and image_features.shape[0] != len(batch_valid_paths) and image_features.shape[1] == len(batch_valid_paths):
++            image_features = image_features.T
++        if image_features.ndim != 2 or image_features.shape[0] != len(batch_valid_paths):
++            raise ValueError(
++                f"Selected image output '{target_output}' has invalid shape {image_features.shape}; "
++                f"expected ({len(batch_valid_paths)}, embedding_dim)."
++            )
++
++        norms = np.linalg.norm(image_features, axis=-1, keepdims=True)
++        normalized_features = image_features / np.where(norms == 0, 1e-12, norms)
++
++        return normalized_features.astype(np.float32), batch_valid_paths
++
++    for i in range(0, len(image_paths), batch_size):
++        batch_paths = image_paths[i : i + batch_size]
++        try:
++            batch_embeddings, batch_valid_paths = run_small_batch(batch_paths)
++        except Exception as batch_err:
++            if len(batch_paths) == 1:
++                print(f"Pominięto obraz po błędzie ONNX {batch_paths[0]}: {repr(batch_err)}")
++                continue
++
++            print(f"Batch obrazów {i + 1}-{i + len(batch_paths)} nie zmieścił się w pamięci. Schodzę do pojedynczych obrazów.")
++            for single_path in batch_paths:
++                try:
++                    batch_embeddings, batch_valid_paths = run_small_batch([single_path])
++                except Exception as single_err:
++                    print(f"Pominięto obraz po błędzie ONNX {single_path}: {repr(single_err)}")
++                    continue
++
++                if batch_embeddings.shape[0] > 0:
++                    feats.append(batch_embeddings)
++                    valid_paths.extend(batch_valid_paths)
++            continue
++
++        if batch_embeddings.shape[0] > 0:
++            feats.append(batch_embeddings)
+             valid_paths.extend(batch_valid_paths)
+-            
+-            # Explicitly free memory before loading the next chunk
+-            del batch_imgs
+-            del inputs
+-            
+-        processed_images += len(chunk_paths)
+-        progress_percent = (processed_images / total_images) * 100
+-        print(f"Progress: {processed_images}/{total_images} images processed ({progress_percent:.1f}%)")
+ 
+     if not feats:
+-        return np.zeros((0, 0), dtype=np.float32), []
++        return np.empty((0, 768), dtype=np.float32), []
+ 
+-    feats = np.concatenate(feats, axis=0).astype(np.float32)
+-    return feats, valid_paths
++    return np.concatenate(feats, axis=0).astype(np.float32), valid_paths
+ 
+ def create_and_save_embeddings(image_paths: List[str] = None):
+     """
+@@ -405,145 +459,495 @@ def update_embeddings(directories: List[str]):
+         f"{len(valid_new_paths)} new images."
+     )
+ 
+-def update_embeddings_from_db(db_path: str) -> str:
++def _resolve_db_image_path(db_path_value: str) -> Path:
++    """Return an absolute image path for a path stored in SQLite."""
++    path_obj = Path(db_path_value)
++    if path_obj.is_absolute():
++        return path_obj
++    return IMAGES_DIR / path_obj
++
++
++def _safe_json_vector(raw_value: str) -> np.ndarray | None:
++    if not raw_value:
++        return None
++    try:
++        return np.array(json.loads(raw_value), dtype=np.float32)
++    except (TypeError, ValueError, json.JSONDecodeError) as exc:
++        print(f"Skipping corrupt vector from SQLite: {exc}")
++        return None
++
++
++def _minmax(values: np.ndarray) -> np.ndarray:
++    if values.size == 0:
++        return values
++    min_v = values.min()
++    max_v = values.max()
++    span = max_v - min_v
++    if span <= 1e-12:
++        return np.zeros_like(values, dtype=np.float32)
++    return (values - min_v) / span
++
++
++def _normalized_flat_vector(vector: np.ndarray) -> np.ndarray:
++    flat = vector.astype("float32").flatten()
++    norm = np.linalg.norm(flat)
++    if norm > 1e-12:
++        return flat / norm
++    return flat
++
++
++def reset_stored_embeddings(db_path: str, reset_images: bool = True, reset_text: bool = True) -> str:
++    """
++    Clears only stored embedding vectors and flags. Metadata/model rows stay intact.
++    The next update_embeddings_from_db run will regenerate cleared vectors.
++    """
++    if not reset_images and not reset_text:
++        return "No embedding columns selected for reset."
++
++    assignments = []
++    if reset_images:
++        assignments.extend(["image_vector = NULL", "image_embedding_exists = 0"])
++    if reset_text:
++        assignments.extend(["text_vector = NULL", "text_embedding_exists = 0"])
++
++    conn = sqlite3.connect(db_path)
++    try:
++        cursor = conn.cursor()
++        cursor.execute(f"UPDATE models SET {', '.join(assignments)}")
++        affected = cursor.rowcount
++        conn.commit()
++        return f"Reset embedding columns for {affected} model rows."
++    except sqlite3.Error:
++        conn.rollback()
++        raise
++    finally:
++        conn.close()
++
++
++def search_similar_metadata_only(query_embedding: np.ndarray, db_path: str, top_k: int = 5) -> list:
++    """
++    Wyszukuje meble wyłącznie na podstawie podobieństwa semantycznego do metadanych tekstowych z SQLite.
++    Ignoruje indeks FAISS (obrazki).
++    """
++    conn = sqlite3.connect(db_path)
++    conn.row_factory = sqlite3.Row
++    cursor = conn.cursor()
++    
++    # Pobieramy z bazy wszystkie modele, które posiadają wygenerowany wektor tekstu
++    cursor.execute("""
++        SELECT id, name, manufacturer, jpg_path, text_vector
++        FROM models
++        WHERE text_vector IS NOT NULL AND jpg_path IS NOT NULL
++    """)
++    rows = cursor.fetchall()
++    conn.close()
++    
++    if not rows:
++        return []
++        
++    results = []
++    q_vec = _normalized_flat_vector(query_embedding)
++    
++    for row in rows:
++        # Dekodujemy zapisany ciąg JSON z bazy z powrotem do tablicy NumPy
++        t_vec = _safe_json_vector(row["text_vector"])
++        if t_vec is None:
++            continue
++        t_vec = _normalized_flat_vector(t_vec)
++        
++        # Obliczamy podobieństwo cosinusowe (iloczyn skalarny dla wektorów znormalizowanych L2)
++        similarity = float(np.dot(q_vec, t_vec))
++        
++        path_to_add = _resolve_db_image_path(row["jpg_path"])
++        results.append({
++            "id": row["id"],
++            "name": row["name"],
++            "manufacturer": row["manufacturer"],
++            "path": str(path_to_add),
++            "distance": similarity  # W naszej architekturze 'distance' to miara podobieństwa (im więcej tym lepiej)
++        })
++        
++    # Sortujemy od najwyższego podobieństwa tekstowego
++    results.sort(key=lambda x: x["distance"], reverse=True)
++    return results[:top_k]
++
++def search_similar_images_from_db(query_embedding: np.ndarray, db_path: str, top_k: int = 5) -> list:
++    """
++    Search image embeddings stored in SQLite. This is the source of truth for
++    add/delete workflows; FAISS can still exist as a rebuildable cache.
++    """
++    conn = sqlite3.connect(db_path)
++    conn.row_factory = sqlite3.Row
++    cursor = conn.cursor()
++    cursor.execute("""
++        SELECT id, name, manufacturer, jpg_path, image_vector
++        FROM models
++        WHERE image_vector IS NOT NULL AND jpg_path IS NOT NULL
++    """)
++    rows = cursor.fetchall()
++    conn.close()
++
++    q_vec = _normalized_flat_vector(query_embedding)
++    results = []
++
++    for row in rows:
++        image_vec = _safe_json_vector(row["image_vector"])
++        if image_vec is None:
++            continue
++        image_vec = _normalized_flat_vector(image_vec)
++
++        results.append({
++            "id": row["id"],
++            "name": row["name"],
++            "manufacturer": row["manufacturer"],
++            "path": str(_resolve_db_image_path(row["jpg_path"])),
++            "distance": float(np.dot(q_vec, image_vec)),
++        })
++
++    results.sort(key=lambda x: x["distance"], reverse=True)
++    return results[:top_k]
++
++
++def search_similar_hybrid(query_embedding: np.ndarray, db_path: str, alpha: float = 0.35, top_k: int = 5) -> list:
++    """
++    Wyszukiwanie hybrydowe z dynamicznym skalowaniem Min-Max dla obu modalności.
++    Sprowadza wyniki tekstu i obrazu do przedziału [0, 1] przed nałożeniem wag Alpha/Beta.
++    """
++    alpha = max(0.0, min(1.0, float(alpha)))
++    beta = 1.0 - alpha
++    query_embedding = query_embedding.astype('float32')
++    faiss.normalize_L2(query_embedding)
++
++    conn = sqlite3.connect(db_path)
++    conn.row_factory = sqlite3.Row
++    cursor = conn.cursor()
++    cursor.execute("""
++        SELECT id, name, manufacturer, jpg_path, image_vector, text_vector
++        FROM models
++        WHERE jpg_path IS NOT NULL
++          AND (image_vector IS NOT NULL OR text_vector IS NOT NULL)
++    """)
++    rows = cursor.fetchall()
++    conn.close()
++    
++    if not rows:
++        return []
++        
++    raw_text_scores = []
++    raw_image_scores = []
++    metadata_list = []
++    
++    q_vec = _normalized_flat_vector(query_embedding)
++    
++    for row in rows:
++        t_vec = _safe_json_vector(row["text_vector"])
++        i_vec = _safe_json_vector(row["image_vector"])
++
++        score_text = float(np.dot(q_vec, _normalized_flat_vector(t_vec))) if t_vec is not None else 0.0
++        score_image = float(np.dot(q_vec, _normalized_flat_vector(i_vec))) if i_vec is not None else 0.0
++        
++        raw_text_scores.append(score_text)
++        raw_image_scores.append(score_image)
++        metadata_list.append({
++            "id": row["id"],
++            "name": row["name"],
++            "manufacturer": row["manufacturer"],
++            "path": row["jpg_path"]
++        })
++
++    np_text = np.array(raw_text_scores, dtype=np.float32)
++    np_image = np.array(raw_image_scores, dtype=np.float32)
++
++    norm_text_scores = _minmax(np_text)
++    norm_image_scores = _minmax(np_image)
++    final_hybrid_scores = (alpha * norm_image_scores) + (beta * norm_text_scores)
++
++    results = []
++    for idx, meta in enumerate(metadata_list):
++        path_to_add = _resolve_db_image_path(meta["path"])
++        results.append({
++            "id": meta["id"],
++            "name": meta["name"],
++            "manufacturer": meta["manufacturer"],
++            "path": str(path_to_add),
++            "distance": float(final_hybrid_scores[idx]), # Wykorzystywane przez C++ jako miara dopasowania
++            "debug_image_score_raw": float(np_image[idx]),
++            "debug_text_score_raw": float(np_text[idx])
++        })
++        
++    results.sort(key=lambda x: x["distance"], reverse=True)
++    return results[:top_k]
++
++def embed_texts_batch(texts: List[str], tokenizer, text_session) -> np.ndarray:
++    """
++    Koduje paczkę tekstów na embeddingi SigLIP 2.
++    Powrót do klasycznego, przewidywalnego wyciągania węzłów wyjściowych z sesji ONNX.
++    """
++    if not texts:
++        return np.empty((0, 768), dtype=np.float32)
++
++    MICRO_BATCH_SIZE = 32
++    all_features = []
++
++    # 1. Pobieramy surowe nazwy wejść i wyjść dokładnie tak, jak widzi je sesja ONNX
++    expected_inputs = [node.name for node in text_session.get_inputs()]
++    expected_outputs = [node.name for node in text_session.get_outputs()]
++
++    # 🚀 JAWNA DIAGNOSTYKA: Zobaczysz w konsoli dokładne nazwy wyjść Twojego modelu
++    print(f"📊 [ONNX DIAGNOSTIC] Wykryte węzły wyjściowe w modelu: {expected_outputs}")
++
++    # 2. Powrót do starej logiki: Wybieramy właściwy węzeł bez przekombinowanych automatów
++    if "text_embeds" in expected_outputs:
++        target_output = "text_embeds"
++    elif len(expected_outputs) > 1:
++        target_output = next(
++            (
++                output_name for output_name in expected_outputs
++                if "text" in output_name.lower() and ("embed" in output_name.lower() or "feature" in output_name.lower())
++            ),
++            expected_outputs[1],
++        )
++    else:
++        target_output = expected_outputs[0]
++
++    print(f"🎯 Celowanie zablokowane na węźle: '{target_output}'")
++
++    try:
++        from . import image_preprocessor
++        from PIL import Image
++        
++        if image_preprocessor.processor is None:
++            image_preprocessor._init_processor()
++            
++        dummy_img = Image.new("RGB", (10, 10))
++        dummy_features = image_preprocessor.processor(images=[dummy_img], return_tensors="np")
++        actual_vision_shape = dummy_features["pixel_values"].shape
++
++        # 3. Pętla przetwarzania (Micro-batching chroniący przed brakiem pamięci VRAM)
++        for b in range(0, len(texts), MICRO_BATCH_SIZE):
++            chunk_texts = texts[b : b + MICRO_BATCH_SIZE]
++            
++            inputs = tokenizer(
++                chunk_texts, 
++                padding=True, 
++                truncation=True, 
++                max_length=64, 
++                return_tensors="np"
++            )
++
++            # Mapowanie wejść
++            onnx_inputs = {
++                "input_ids": inputs["input_ids"].astype(np.int64)
++            }
++
++            if "attention_mask" in expected_inputs:
++                if "attention_mask" in inputs:
++                    onnx_inputs["attention_mask"] = inputs["attention_mask"].astype(np.int64)
++                else:
++                    onnx_inputs["attention_mask"] = np.ones_like(inputs["input_ids"]).astype(np.int64)
++            
++            if "pixel_values" in expected_inputs:
++                dummy_shape = [len(chunk_texts), actual_vision_shape[1], actual_vision_shape[2], actual_vision_shape[3]]
++                onnx_inputs["pixel_values"] = np.zeros(dummy_shape, dtype=np.float32)
++
++            # 🚀 KLASYCZNE WYWOŁANIE: Odpytujemy stabilnie jeden, konkretny węzeł tekstowy
++            raw_outputs = text_session.run([target_output], onnx_inputs)
++            text_features = raw_outputs[0]
++            if text_features.ndim != 2 or text_features.shape[0] != len(chunk_texts):
++                raise ValueError(
++                    f"Selected text output '{target_output}' has invalid shape {text_features.shape}; "
++                    f"expected ({len(chunk_texts)}, embedding_dim)."
++                )
++
++            # Normalizacja L2 (Krytyczna do wyszukiwania cosinusowego)
++            norms = np.linalg.norm(text_features, axis=-1, keepdims=True)
++            normalized_features = text_features / np.where(norms == 0, 1e-12, norms)
++            
++            all_features.append(normalized_features)
++
++        return np.concatenate(all_features, axis=0).astype(np.float32)
++
++    except Exception as e:
++        print(f"❌ [KRYTYCZNY BŁĄD AI] Awaria w embed_texts_batch: {e}")
++        raise e
++    
++def update_embeddings_from_db(db_path: str, tokenizer, text_session) -> str:
+     """
+-    Lekka, produkcyjna pętla uzgadniania stanu dla ścieżek względnych.
+-    Gwarantuje relację 1-do-wielu bez dublowania pracy SigLIP 2.
++    Ujednolicona, pancerne pętla synchronizacji.
++    Sprowadza wszystkie ścieżki (z bazy, FAISS i AI) do pełnego stanu bezwzględnego (Absolute Lowercase),
++    eliminując błędy mapowania Windowsa raz na zawsze.
+     """
+-    print("\n=== SYSTEM SYNCHRONIZACJI PRODUKCYJNEJ (Ścieżki Względne) ===")
+-    start_check = time.time()
+-    CHECKPOINT_SIZE = 1000
++    print("\n=== SYSTEM SYNCHRONIZACJI MULTIMODALNEJ (Pełna Normalizacja Ścieżek) ===")
++    start_time = time.time()
++    CHECKPOINT_SIZE = 1024
+ 
+-    # 1. Odczyt aktualnego stanu relatywnego z dysku
++    # 1. Odczyt i konwersja istniejącego cache FAISS do pełnych ścieżek lowercase
+     index, image_paths_list = load_index_and_paths()
+     if image_paths_list is None:
+         image_paths_list = []
+-    existing_paths = set(image_paths_list)
++    
++    normalized_existing_faiss = set()
++    for p in image_paths_list:
++        try:
++            p_obj = Path(p)
++            if not p_obj.is_absolute():
++                p_obj = IMAGES_DIR / p_obj
++            normalized_existing_faiss.add(str(p_obj.resolve()).lower())
++        except Exception:
++            pass
+ 
+     conn = sqlite3.connect(db_path)
+     conn.row_factory = sqlite3.Row
+-    
+-    path_groups = {}
+-    images_to_embed = []
+-    healed_to_exists = 0
+-    healed_to_missing = 0
++    cursor = conn.cursor()
++
++    image_processed_count = 0
++    text_processed_count = 0
+ 
+     try:
+-        cursor = conn.cursor()
+-        
+-        # Pobieramy wszystkie ścieżki z bazy (które są już relatywne)
+-        cursor.execute("SELECT id, name, jpg_path, image_embedding_exists FROM models WHERE jpg_path IS NOT NULL")
++        # =====================================================================
++        # FAZA 1: PRZETWARZANIE OBRAZÓW
++        # =====================================================================
++        cursor.execute("""
++            SELECT id, jpg_path, image_embedding_exists, image_vector
++            FROM models
++            WHERE jpg_path IS NOT NULL
++        """)
+         rows = cursor.fetchall()
+-
++        
+         if not rows:
++            conn.close()
+             return "Baza danych SQLite jest pusta."
+ 
+-        # KROK A: Grupowanie po ścieżkach względnych z uwzględnieniem IMAGES_DIR
+-        with conn:
+-            for row in rows:
+-                model_id = row["id"]
+-                db_flag = row["image_embedding_exists"]
+-                rel_path = row["jpg_path"].strip()
+-
+-                # Poprawka rozszerzenia, jeśli baza go nie miała
+-                p_rel = Path(rel_path)
+-                if not p_rel.suffix:
+-                    p_rel = p_rel.with_suffix(".jpg")
+-                    rel_path = str(p_rel)
+-
+-                # 🚀 SPRAWDZENIE: Łączymy bazę klienta ze ścieżką względną
+-                if (IMAGES_DIR / rel_path).exists():
+-                    # 🎯 KLUCZEM w słowniku staje się unikalna ścieżka WZGLĘDNA
+-                    if rel_path not in path_groups:
+-                        path_groups[rel_path] = []
+-                    path_groups[rel_path].append({"id": model_id, "flag": db_flag})
+-
++        path_groups = {}
++        images_to_embed = set() # Set zapobiega dublowaniu identycznych ścieżek systemowych
+         
+-        normalized_existing = {p.lower() for p in image_paths_list}
++        for row in rows:
++            rel_path = row["jpg_path"].strip()
++            if not rel_path:
++                continue
+                 
+-        with conn:
+-            for rel_path, models in path_groups.items():
+-                # 2. Ścieżkę z bazy danych przed testem "in" traktujemy dokładnie tak samo
+-                lookup_path = rel_path.lower()
++            p_rel = Path(rel_path)
++            if not p_rel.suffix:
++                p_rel = p_rel.with_suffix(".jpg")
++
++            # 🚀 KLUCZ: Tworzymy pełną, bezwzględną ścieżkę systemową dla Windowsa
++            if p_rel.is_absolute():
++                full_path = p_rel.resolve()
++            else:
++                full_path = (IMAGES_DIR / p_rel).resolve()
+ 
+-                # Teraz dopasowanie zadziała zawsze, niezależnie od formatu pliku
+-                is_in_faiss = lookup_path in normalized_existing
++            if full_path.exists():
++                # Jako klucza używamy absolutnego, rozwiązanego stringu lowercase
++                norm_key = str(full_path).lower()
+                 
+-                for m in models:
+-                    if is_in_faiss and m["flag"] == 0:
+-                        cursor.execute("UPDATE models SET image_embedding_exists = 1 WHERE id = ?", (m["id"],))
+-                        healed_to_exists += 1
+-                    elif not is_in_faiss and m["flag"] == 1:
+-                        cursor.execute("UPDATE models SET image_embedding_exists = 0 WHERE id = ?", (m["id"],))
+-                        healed_to_missing += 1
++                if norm_key not in path_groups:
++                    path_groups[norm_key] = []
++                path_groups[norm_key].append({"id": row["id"], "flag": row["image_embedding_exists"]})
+                 
+-                if not is_in_faiss:
+-                    images_to_embed.append(rel_path)
++                needs_db_vector = not row["image_vector"]
++                if row["image_vector"] and row["image_embedding_exists"] == 0:
++                    cursor.execute("UPDATE models SET image_embedding_exists = 1 WHERE id = ?", (row["id"],))
+ 
+-        print(f"⏱️ Weryfikacja spójności unikalnych zasobów zakończona w {time.time() - start_check:.4f}s.")
+-        print(f"📊 Statystyki struktury: Wykryto {len(path_groups)} unikalnych zdjęć dla {len(rows)} modeli bazy.")
+-        
+-        if healed_to_exists > 0 or healed_to_missing > 0:
+-            print(f"⚡ [Self-Healing] Dostrojono flagi: oznaczono jako istniejące: {healed_to_exists}, zresetowano: {healed_to_missing}")
+-
+-        total_images_to_process = len(images_to_embed)
+-        if total_images_to_process == 0:
+-            return "Wszystkie systemy są w harmonii. Indeks FAISS (Względny) i baza SQLite są idealnie zsynchronizowane."
+-
+-        print(f"🚀 Do faktycznego przetworzenia przez SigLIP 2 pozostało: {total_images_to_process} UNIKALNYCH obrazów.")
+-        print(f"💾 Punkty kontrolne (Checkpoints) zabezpieczą dysk co {CHECKPOINT_SIZE} zdjęć.")
+-
+-        # --- GŁÓWNA PĘTLA BLOKOWA DLA EMBEDDINGÓW ---
+-        checkpoint_count = 0
+-        for i in range(0, total_images_to_process, CHECKPOINT_SIZE):
+-            chunk_paths = images_to_embed[i : i + CHECKPOINT_SIZE]
+-            current_block_num = (i // CHECKPOINT_SIZE) + 1
+-            total_blocks = (total_images_to_process + CHECKPOINT_SIZE - 1) // CHECKPOINT_SIZE
+-            
+-            print(f"\n📦 [Blok {current_block_num}/{total_blocks}] Przetwarzanie partii {len(chunk_paths)} unikalnych zdjęć...")
+-            
+-            # 🚀 KLUCZOWE: Budujemy ścieżki absolutne TYLKO dla modelu AI, żeby mógł otworzyć plik obrazu
+-            absolute_chunk_paths = [str((IMAGES_DIR / p).resolve()) for p in chunk_paths]
+-            
+-            new_embeddings, valid_absolute_paths = embed_images_batch(absolute_chunk_paths)
+-            
+-            if new_embeddings.shape[0] == 0 or not valid_absolute_paths:
+-                continue
++                if needs_db_vector:
++                    images_to_embed.add(str(full_path))
+ 
+-            # 🚀 KLUCZOWE: Po powrocie z AI, obcinamy przedrostek z powrotem do formatu względnego dla pliku JSON
+-            valid_relative_paths = [str(Path(p).relative_to(IMAGES_DIR)) for p in valid_absolute_paths]
++        images_to_embed = list(images_to_embed)
++        total_images = len(images_to_embed)
++        
++        if total_images > 0:
++            print(f"📸 Wykryto {total_images} nowych unikalnych obrazów do przetworzenia.")
++            for i in range(0, total_images, CHECKPOINT_SIZE):
++                chunk_paths = images_to_embed[i : i + CHECKPOINT_SIZE]
++                
++                # chunk_paths są już pełnymi ścieżkami absolutnymi, nie musimy ich dotykać
++                new_img_embeddings, valid_absolute_paths = embed_images_batch(chunk_paths)
++                
++                if new_img_embeddings.shape[0] > 0 and valid_absolute_paths:
++                    if index is None:
++                        index = faiss.IndexFlatIP(new_img_embeddings.shape[1])
++
++                    faiss_embeddings_to_add = []
++
++                    for idx, abs_path_str in enumerate(valid_absolute_paths):
++                        # Konwertujemy ścieżkę zwróconą z AI na nasz wspólny mianownik (abs lowercase)
++                        lookup_key = str(Path(abs_path_str).resolve()).lower()
++                        
++                        if lookup_key not in normalized_existing_faiss:
++                            try:
++                                rel_path_faiss = str(Path(abs_path_str).relative_to(IMAGES_DIR))
++                            except ValueError:
++                                rel_path_faiss = abs_path_str
++
++                            image_paths_list.append(rel_path_faiss)
++                            normalized_existing_faiss.add(lookup_key)
++                            faiss_embeddings_to_add.append(new_img_embeddings[idx])
++                        
++                        # Mapowanie i aktualizacja rekordów w SQLite
++                        vector_json = json.dumps(new_img_embeddings[idx].tolist())
++                        associated_models = path_groups.get(lookup_key, [])
++                        
++                        for m in associated_models:
++                            cursor.execute("""
++                                UPDATE models 
++                                SET image_vector = ?, image_embedding_exists = 1 
++                                WHERE id = ?
++                            """, (vector_json, m["id"]))
++                            image_processed_count += 1
++
++                    if faiss_embeddings_to_add:
++                        index.add(np.asarray(faiss_embeddings_to_add, dtype=np.float32))
++                
++                # Zapis i twardy commit paczki na dysk
++                if index is not None:
++                    faiss.write_index(index, str(FAISS_INDEX_PATH))
++                with open(IMAGE_PATHS_LIST, "w", encoding="utf-8") as f:
++                    json.dump(image_paths_list, f, ensure_ascii=False, indent=2)
++                conn.commit()
++                print(f"🔒 [Checkpoint Obrazów] Zapisano partię na dysku. Łącznie zaktualizowano: {image_processed_count} modeli CAD.")
++
++        conn.commit()
++
++        # =====================================================================
++        # FAZA 2: PRZETWARZANIE TEKSTÓW (Bez żadnego śladu po 'category'!)
++        # =====================================================================
++        cursor.execute("""
++            SELECT id, name, manufacturer, opis_produktu, grupa, typ, typ_standardowy
++            FROM models 
++            WHERE text_embedding_exists = 0 OR text_vector IS NULL
++        """)
++        text_rows = cursor.fetchall()
++
++        total_texts = len(text_rows)
++        if total_texts > 0:
++            print(f"📝 Przetwarzanie {total_texts} opisów tekstowych przez DirectML...")
++            for i in range(0, total_texts, CHECKPOINT_SIZE):
++                chunk_rows = text_rows[i : i + CHECKPOINT_SIZE]
++                
++                prompts_chunk = []
++                for r in chunk_rows:
++                    p_text = f"Produkt: {r['name'] or ''}. Producent: {r['manufacturer'] or ''}. Opis: {r['opis_produktu'] or ''}. Grupa: {r['grupa'] or ''}. Typ: {r['typ'] or ''}. Typ standardowy: {r['typ_standardowy'] or ''}."
++                    prompts_chunk.append(p_text.strip())
++                
++                new_text_embeddings = embed_texts_batch(prompts_chunk, tokenizer, text_session) 
++                
++                for idx, r in enumerate(chunk_rows):
++                    text_vector_json = json.dumps(new_text_embeddings[idx].tolist())
++                    cursor.execute("""
++                        UPDATE models 
++                        SET text_vector = ?, text_embedding_exists = 1 
++                        WHERE id = ?
++                    """, (text_vector_json, r["id"]))
++                    text_processed_count += 1
++                
++                conn.commit()
++                print(f"🔒 [Zapis tekstów] Postęp: {i + len(chunk_rows)} / {total_texts}")
+ 
+-            if index is None:
+-                index = faiss.IndexFlatIP(new_embeddings.shape[1])
+-            
+-            index.add(new_embeddings)
+-            image_paths_list.extend(valid_relative_paths)
++        duration = time.time() - start_time
++        return f"🏁 Sukces! Zapisano w bazie obrazów: {image_processed_count}, tekstów: {text_processed_count} (Czas: {duration:.2f}s)."
+ 
+-            # Zapis indeksu .bin
+-            tmp_index = str(FAISS_INDEX_PATH) + ".tmp"
+-            faiss.write_index(index, tmp_index)
+-            os.replace(tmp_index, str(FAISS_INDEX_PATH))
+-            
+-            # Zapis ścieżek .json (Tylko czyste ścieżki względne!)
+-            tmp_json = str(IMAGE_PATHS_LIST) + ".tmp"
+-            with open(tmp_json, "w", encoding="utf-8") as f:
+-                json.dump(image_paths_list, f, ensure_ascii=False, indent=2)
+-            os.replace(tmp_json, IMAGE_PATHS_LIST)
+-
+-            # Masowa aktualizacja flag '1' w SQLite dla wszystkich powiązanych modeli
+-            with conn:
+-                for rel_path in valid_relative_paths:
+-                    associated_models = path_groups.get(rel_path, [])
+-                    for m in associated_models:
+-                        cursor.execute("UPDATE models SET image_embedding_exists = 1 WHERE id = ?", (m["id"],))
+-
+-            checkpoint_count += len(valid_relative_paths)
+-            print(f"🔒 [Checkpoint Zablokowany] Postęp zapisu unikalnych: {i + len(chunk_paths)} / {total_images_to_process}")
+-
+-        return f"Synchronizacja udana. Przetworzono unikalnych obrazów: {checkpoint_count}."
+-
+-    except sqlite3.Error as e:
+-        print(f"❌ Krytyczny błąd bazy danych podczas pętli produkcyjnej V5: {e}")
++    except Exception as e:
++        print(f"❌ Krytyczny błąd podczas pracy skryptu: {e}")
++        conn.rollback()
+         raise
+     finally:
+-        conn.close()
+\ No newline at end of file
++        conn.close()
+diff --git a/clip_fast_api/app/server.py b/clip_fast_api/app/server.py
+index 59e9297..6041788 100644
+--- a/clip_fast_api/app/server.py
++++ b/clip_fast_api/app/server.py
+@@ -3,23 +3,31 @@ import time
+ from pathlib import Path
+ from typing import List
+ import uvicorn
+-import onnxruntime as ort
+ from fastapi import FastAPI, HTTPException, UploadFile, File, Request
+ from fastapi.responses import JSONResponse
+ from pydantic import BaseModel
+-from transformers import AutoTokenizer, AutoProcessor
++from transformers import AutoTokenizer
+ from dotenv import load_dotenv
+ from .image_preprocessor import preprocess_image
+-from .clip_model import get_text_embedding as get_clip_text_embedding, get_image_embedding
++# 🚀 POPRAWKA: Zaimportowano _get_active_session, aby móc pobrać instancję DirectML
++from .clip_model import get_text_embedding as get_clip_text_embedding, get_image_embedding, _get_active_session
+ from app import config
+ from .embedding_store import (
+     create_and_save_embeddings,
+     load_index_and_paths,
+     search_similar_images,
+-    update_embeddings,
+     update_embeddings_from_db,
++    reset_stored_embeddings,
++    search_similar_metadata_only, # 🚀 Dodaj to
++    search_similar_hybrid,        # 🚀 Dodaj to
++    search_similar_images_from_db,
++    embed_images_batch,
++    embed_texts_batch             # Do bezpośredniego kodowania zapytania
+ )
+-from .config import MODELS_DIR, EMBEDDINGS_DIR, DB_PATH
++from .config import DB_PATH
++from threading import Thread
++import traceback
++from contextlib import asynccontextmanager
+ 
+ # Load environment variables from .env file
+ load_dotenv()
+@@ -31,9 +39,6 @@ if hf_token:
+ else:
+     print("⚠️  HF_TOKEN environment variable not set. This may be required for some models.")
+ 
+-import traceback
+-from contextlib import asynccontextmanager
+-
+ # --- SCHEMAS ---
+ 
+ class TextPrompt(BaseModel):
+@@ -43,6 +48,16 @@ class TextPrompt(BaseModel):
+ class UpdateDirectories(BaseModel):
+     directories: List[str]
+ 
++# Dopisz pod klasą TextPrompt:
++class HybridTextPrompt(BaseModel):
++    text: str
++    top_k: int = 5
++    alpha: float = 0.8  # 🚀 Waga dla obrazu (np. 0.4 oznacza 40% obraz, 60% tekst metadata)
++
++class RebuildEmbeddingsRequest(BaseModel):
++    images: bool = True
++    text: bool = True
++
+ # --- LIFECYCLE EVENTS ---
+ 
+ @asynccontextmanager
+@@ -55,7 +70,7 @@ async def lifespan(app: FastAPI):
+ 
+     try:
+         # ---------------------------
+-        # TOKENIZER
++        # STEP 1: TOKENIZER
+         # ---------------------------
+         print("STEP 1: Loading tokenizer...")
+         start = time.time()
+@@ -72,10 +87,9 @@ async def lifespan(app: FastAPI):
+         print(f"✅ Tokenizer loaded in {time.time() - start:.2f}s")
+ 
+         # ---------------------------
+-        # FAISS
++        # STEP 2: FAISS
+         # ---------------------------
+         print("STEP 2: Loading FAISS index...")
+-
+         try:
+             index, image_paths = load_index_and_paths()
+ 
+@@ -92,19 +106,28 @@ async def lifespan(app: FastAPI):
+             image_paths = []
+ 
+         # ---------------------------
+-        # STEP 3: BACKGROUND AUTOMATIC SYNC
++        # 🚀 STEP 3: ONNX DIRECTML TEXT SESSION INITIALIZATION
+         # ---------------------------
+-        from threading import Thread
+-        from .embedding_store import update_embeddings_from_db  # Upewnij się, że ścieżka importu pasuje
++        print("STEP 3: Loading ONNX Text Session via DirectML...")
++        start_session = time.time()
++        
++        print("STEP 2.5: Loading DirectML Text Session...")
++        app.state.text_session = _get_active_session("text")
++        print("✅ DirectML Text Session hooked successfully.")
++        
++        print(f"✅ ONNX Text Session ready in {time.time() - start_session:.2f}s")
+ 
++        # ---------------------------
++        # STEP 4: BACKGROUND AUTOMATIC SYNC
++        # --------------------------
+         def auto_sync_worker():
+             global index, image_paths
+             try:
+                 print("🔍 [Background Sync] Checking SQLite for new models missing embeddings...")
+                 sync_start = time.time()
+                 
+-                # Przetwarzanie bazy danych SigLIP-em w osobnym wątku
+-                message = update_embeddings_from_db(DB_PATH)
++                # Przetwarzanie bazy danych SigLIP-em w osobnym wątku - sesja pobierana z app.state
++                message = update_embeddings_from_db(DB_PATH, app.state.tokenizer, app.state.text_session)
+                 print(f"ℹ️ [Background Sync] {message}")
+                 
+                 # Natychmiastowe załadowanie świeżo wygenerowanych wektorów do działającego RAM-u FastAPI
+@@ -121,6 +144,7 @@ async def lifespan(app: FastAPI):
+         traceback.print_exc()
+ 
+         app.state.tokenizer = None
++        app.state.text_session = None
+ 
+     yield
+ 
+@@ -130,8 +154,112 @@ async def lifespan(app: FastAPI):
+ app = FastAPI(lifespan=lifespan)
+ index, image_paths = None, None  
+ 
++@app.post("/sync")
++async def sync_faiss_index(request: Request):
++    try:
++        # Pobieramy referencje do silników załadowanych w lifespan przy starcie
++        active_tokenizer = app.state.tokenizer 
++        active_text_session = app.state.text_session
++        
++        # Przekazujemy komplet narzędzi do skryptu bazy danych
++        message = update_embeddings_from_db(str(config.DB_PATH), active_tokenizer, active_text_session)
++        
++        return {"status": "success", "detail": message}
++    except Exception as e:
++        return {"status": "error", "detail": str(e)}
++
++@app.post("/rebuild-embeddings")
++async def rebuild_embeddings(request_body: RebuildEmbeddingsRequest, request: Request):
++    """
++    Clears selected stored vectors and regenerates them from the current ONNX output selection.
++    Model metadata remains untouched.
++    """
++    global index, image_paths
++
++    try:
++        active_tokenizer = request.app.state.tokenizer
++        active_text_session = request.app.state.text_session
+ 
+-# --- EMBEDDING ENDPOINTS ---
++        if active_tokenizer is None or active_text_session is None:
++            raise HTTPException(status_code=500, detail="AI Engine components are uninitialized.")
++
++        reset_message = reset_stored_embeddings(
++            str(config.DB_PATH),
++            reset_images=request_body.images,
++            reset_text=request_body.text,
++        )
++        rebuild_message = update_embeddings_from_db(str(config.DB_PATH), active_tokenizer, active_text_session)
++
++        index, image_paths = load_index_and_paths()
++
++        return {
++            "status": "success",
++            "reset": reset_message,
++            "rebuild": rebuild_message,
++        }
++    except Exception as e:
++        print(f"❌ Rebuild embeddings failed: {e}")
++        raise HTTPException(status_code=500, detail=str(e))
++    
++@app.post("/find-similar-images-by-text-metadata")
++def find_similar_images_by_text_metadata(prompt: TextPrompt, request: Request):
++    """Trasa wyszukująca meble WYŁĄCZNIE po wektorach metadanych tekstowych."""
++    print(f"🔎 Received metadata-only text search request: {prompt.text} (top_k={prompt.top_k})")
++    start_time = time.time()
++    
++    try:
++        active_tokenizer = request.app.state.tokenizer
++        active_text_session = request.app.state.text_session
++        
++        if active_tokenizer is None or active_text_session is None:
++            raise HTTPException(status_code=500, detail="AI Models/Tokenizers are not initialized.")
++
++        # Generujemy wektor dla wpisanej frazy użytkownika przy użyciu naszej bezpiecznej metody
++        query_embedding = embed_texts_batch([prompt.text], active_tokenizer, active_text_session)
++        
++        # Wykonujemy wyszukiwanie bezpośrednio w bazie danych SQLite
++        results = search_similar_metadata_only(query_embedding, str(config.DB_PATH), prompt.top_k)
++        
++        elapsed = time.time() - start_time
++        print(f"⏱️ Metadata text search completed in {elapsed:.3f} seconds.")
++        return JSONResponse(content=results)
++        
++    except Exception as e:
++        print(f"❌ Metadata search failed: {e}")
++        raise HTTPException(status_code=500, detail=str(e))
++
++
++@app.post("/find-similar-images-by-hybrid-search")
++def find_similar_images_by_hybrid_search(prompt: HybridTextPrompt, request: Request):
++    """Trasa łącząca siłę oka AI (FAISS) oraz rozumu AI (metadane SQLite)."""
++    print(f"🎛️ Received HYBRID search request: {prompt.text} (alpha={prompt.alpha}, top_k={prompt.top_k})")
++    start_time = time.time()
++
++    try:
++        active_tokenizer = request.app.state.tokenizer
++        active_text_session = request.app.state.text_session
++        
++        if active_tokenizer is None or active_text_session is None:
++            raise HTTPException(status_code=500, detail="AI Engine components are uninitialized.")
++
++        # Generujemy wektor zapytania
++        query_embedding = embed_texts_batch([prompt.text], active_tokenizer, active_text_session)
++        
++        # Wywołujemy silnik fuzji wagowej z embedding_store
++        results = search_similar_hybrid(
++            query_embedding=query_embedding,
++            db_path=str(config.DB_PATH),
++            alpha=prompt.alpha,
++            top_k=prompt.top_k
++        )
++        
++        elapsed = time.time() - start_time
++        print(f"⏱️ Hybrid score-fusion search completed in {elapsed:.3f} seconds.")
++        return JSONResponse(content=results)
++        
++    except Exception as e:
++        print(f"❌ Hybrid search failed: {e}")
++        raise HTTPException(status_code=500, detail=str(e))
+ 
+ @app.post("/get-embedding")
+ def get_embedding_endpoint(prompt: TextPrompt, request: Request):
+@@ -180,7 +308,7 @@ def update_embeddings_endpoint():
+     try:
+         
+         # 2. Wywołujemy nową funkcję synchronizującą bazę z SigLIP 2 i FAISS
+-        message = update_embeddings_from_db(DB_PATH)
++        message = update_embeddings_from_db(DB_PATH, app.state.tokenizer, app.state.text_session)
+         
+         # 3. Krytyczne: Przeładowujemy indeks w pamięci RAM serwera FastAPI
+         global index, image_paths
+@@ -239,11 +367,8 @@ def find_similar_images_by_text(prompt: TextPrompt, request: Request):
+ 
+ @app.post("/find-similar-images-by-image")
+ async def find_similar_images_by_image(file: UploadFile = File(...), top_k: int = 5):
+-    global index, image_paths
+     print(f"Received image search request (top_k={top_k})")
+     start_time = time.time()
+-    if index is None:
+-        raise HTTPException(status_code=400, detail="Index not loaded.")
+ 
+     try:
+         temp_path = None
+@@ -252,10 +377,11 @@ async def find_similar_images_by_image(file: UploadFile = File(...), top_k: int
+             with open(temp_path, "wb") as buffer:
+                 buffer.write(await file.read())
+ 
+-            pixel_values = preprocess_image(str(temp_path))
+-            image_embedding = get_image_embedding(pixel_values)
++            image_embedding, valid_paths = embed_images_batch([str(temp_path)])
++            if image_embedding.shape[0] == 0 or not valid_paths:
++                raise HTTPException(status_code=400, detail="Could not generate an embedding for the uploaded image.")
+             
+-            results = search_similar_images(image_embedding, index, image_paths, top_k)
++            results = search_similar_images_from_db(image_embedding, str(config.DB_PATH), top_k)
+         finally:
+             if temp_path and temp_path.exists():
+                 temp_path.unlink()
+@@ -276,4 +402,4 @@ def health():
+ 
+ # --- MAIN RUNNER ---
+ if __name__ == "__main__":
+-    uvicorn.run(app, host="0.0.0.0", port=8000)
+\ No newline at end of file
++    uvicorn.run(app, host="0.0.0.0", port=8000)
+diff --git a/clip_fast_api/model_manager.ipynb b/clip_fast_api/model_manager.ipynb
+index 538b892..0c57aea 100644
+--- a/clip_fast_api/model_manager.ipynb
++++ b/clip_fast_api/model_manager.ipynb
+@@ -444,7 +444,7 @@
+  ],
+  "metadata": {
+   "kernelspec": {
+-   "display_name": "venv (3.13.5.final.0)",
++   "display_name": "clip_env (3.13.5.final.0)",
+    "language": "python",
+    "name": "python3"
+   },
+diff --git a/clip_fast_api/start_server.py b/clip_fast_api/start_server.py
+index 9cef2d3..dc5a4f7 100644
+--- a/clip_fast_api/start_server.py
++++ b/clip_fast_api/start_server.py
+@@ -1,8 +1,83 @@
++import argparse
++import socket
++import sys
+ import uvicorn
+ import multiprocessing
++from pathlib import Path
++
++# Importujemy aplikację oraz ścieżkę do głównego katalogu CAD z Twojej konfiguracji
+ from app.server import app
++from app.config import CPP_APP_DIR  
++
++def find_first_free_port(start_port: int, max_scans: int = 50) -> int:
++    """Scans ports sequentially starting from start_port to find an available one."""
++    for port in range(start_port, start_port + max_scans):
++        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
++            try:
++                s.bind(("127.0.0.1", port))
++                return port
++            except OSError:
++                print(f"⚠️ Port {port} is busy, scanning next...")
++                continue
++    raise IOError(f"❌ Critical: No free ports found between {start_port} and {start_port + max_scans}")
++
++
++def update_cpp_config(cpp_dir: Path, port: int):
++    """Safely updates or appends the base_url inside the C++ config.txt file."""
++    config_file = cpp_dir / "config.txt"
++    new_line = f"base_url=http://127.0.0.1:{port}\n"
++    
++    if not config_file.exists():
++        # Jeśli plik z jakiegoś powodu nie istnieje, tworzymy go z naszą linią
++        config_file.write_text(new_line, encoding="utf-8")
++        print(f"📝 Created new C++ config file with: {new_line.strip()}")
++        return
++
++    # Czytamy obecną zawartość pliku line-by-line
++    lines = config_file.read_text(encoding="utf-8").splitlines(keepends=True)
++    updated = False
++
++    for i, line in enumerate(lines):
++        # Szukamy linii zaczynającej się od base_url= (ignorując spacje)
++        if line.strip().startswith("base_url="):
++            lines[i] = new_line
++            updated = True
++            break
++
++    # Jeśli w pliku nie było jeszcze klucza base_url=, dopisujemy go na końcu
++    if not updated:
++        lines.append("\n" + new_line)
++
++    # Zapisujemy zmodyfikowaną zawartość z powrotem na dysk
++    config_file.write_text("".join(lines), encoding="utf-8")
++    print(f"🚀 Updated C++ config.txt successfully with: {new_line.strip()}")
++
+ 
+ if __name__ == "__main__":
+-    # Required to prevent recursive spawning in compiled Python executables
++    # Required to prevent recursive spawning in compiled PyInstaller executables
+     multiprocessing.freeze_support()
+-    uvicorn.run(app, host="0.0.0.0", port=8000)
+\ No newline at end of file
++
++    # 1. Parser argumentów startowych
++    parser = argparse.ArgumentParser(description="Multimodal Search Backend Server")
++    parser.add_argument("--port", type=int, default=8000, help="Base port number to start scanning from")
++    args = parser.parse_args()
++
++    # 2. 🔒 Bezpieczny host - tylko połączenia lokalne
++    secure_host = "127.0.0.1"
++
++    try:
++        # 3. Szukanie wolnego portu
++        final_port = find_first_free_port(args.port)
++
++        # 4. 🫱‍🫲 HANDSHAKE: Automatyczna aktualizacja pliku config.txt dla C++
++        # Używamy wyliczonej w config.py ścieżki CPP_APP_DIR
++        update_cpp_config(CPP_APP_DIR, final_port)
++
++        print(f"\n📡 SERVER_ADDRESS_READY -> http://{secure_host}:{final_port}\n")
++
++        # 5. Uruchomienie serwera
++        uvicorn.run(app, host=secure_host, port=final_port, log_level="info")
++
++    except Exception as e:
++        print(f"❌ FATAL: Backend server failed to initialize: {e}")
++        sys.exit(1)
+\ No newline at end of file
+diff --git a/start.bat b/start.bat
+index d5f8ff6..2920dd3 100644
+--- a/start.bat
++++ b/start.bat
+@@ -18,7 +18,7 @@ echo ==============================
+ echo Starting C++ application...
+ echo ==============================
+ 
+-cd /d "%~dp0CPP_apka\build\Release"
++cd /d "%~dp0search_client\build\Release"
+ start "" TestBackend.exe
+ 
+ echo All started.

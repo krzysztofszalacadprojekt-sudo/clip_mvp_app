@@ -3,23 +3,31 @@ import time
 from pathlib import Path
 from typing import List
 import uvicorn
-import onnxruntime as ort
 from fastapi import FastAPI, HTTPException, UploadFile, File, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from transformers import AutoTokenizer, AutoProcessor
+from transformers import AutoTokenizer
 from dotenv import load_dotenv
 from .image_preprocessor import preprocess_image
-from .clip_model import get_text_embedding as get_clip_text_embedding, get_image_embedding
+# 🚀 POPRAWKA: Zaimportowano _get_active_session, aby móc pobrać instancję DirectML
+from .clip_model import get_text_embedding as get_clip_text_embedding, get_image_embedding, _get_active_session
 from app import config
 from .embedding_store import (
     create_and_save_embeddings,
     load_index_and_paths,
     search_similar_images,
-    update_embeddings,
     update_embeddings_from_db,
+    reset_stored_embeddings,
+    search_similar_metadata_only, # 🚀 Dodaj to
+    search_similar_hybrid,        # 🚀 Dodaj to
+    search_similar_images_from_db,
+    embed_images_batch,
+    embed_texts_batch             # Do bezpośredniego kodowania zapytania
 )
-from .config import MODELS_DIR, EMBEDDINGS_DIR, DB_PATH
+from .config import DB_PATH
+from threading import Thread
+import traceback
+from contextlib import asynccontextmanager
 
 # Load environment variables from .env file
 load_dotenv()
@@ -31,9 +39,6 @@ if hf_token:
 else:
     print("⚠️  HF_TOKEN environment variable not set. This may be required for some models.")
 
-import traceback
-from contextlib import asynccontextmanager
-
 # --- SCHEMAS ---
 
 class TextPrompt(BaseModel):
@@ -42,6 +47,16 @@ class TextPrompt(BaseModel):
 
 class UpdateDirectories(BaseModel):
     directories: List[str]
+
+# Dopisz pod klasą TextPrompt:
+class HybridTextPrompt(BaseModel):
+    text: str
+    top_k: int = 5
+    alpha: float = 0.8  # 🚀 Waga dla obrazu (np. 0.4 oznacza 40% obraz, 60% tekst metadata)
+
+class RebuildEmbeddingsRequest(BaseModel):
+    images: bool = True
+    text: bool = True
 
 # --- LIFECYCLE EVENTS ---
 
@@ -55,7 +70,7 @@ async def lifespan(app: FastAPI):
 
     try:
         # ---------------------------
-        # TOKENIZER
+        # STEP 1: TOKENIZER
         # ---------------------------
         print("STEP 1: Loading tokenizer...")
         start = time.time()
@@ -72,10 +87,9 @@ async def lifespan(app: FastAPI):
         print(f"✅ Tokenizer loaded in {time.time() - start:.2f}s")
 
         # ---------------------------
-        # FAISS
+        # STEP 2: FAISS
         # ---------------------------
         print("STEP 2: Loading FAISS index...")
-
         try:
             index, image_paths = load_index_and_paths()
 
@@ -92,19 +106,28 @@ async def lifespan(app: FastAPI):
             image_paths = []
 
         # ---------------------------
-        # STEP 3: BACKGROUND AUTOMATIC SYNC
+        # 🚀 STEP 3: ONNX DIRECTML TEXT SESSION INITIALIZATION
         # ---------------------------
-        from threading import Thread
-        from .embedding_store import update_embeddings_from_db  # Upewnij się, że ścieżka importu pasuje
+        print("STEP 3: Loading ONNX Text Session via DirectML...")
+        start_session = time.time()
+        
+        print("STEP 2.5: Loading DirectML Text Session...")
+        app.state.text_session = _get_active_session("text")
+        print("✅ DirectML Text Session hooked successfully.")
+        
+        print(f"✅ ONNX Text Session ready in {time.time() - start_session:.2f}s")
 
+        # ---------------------------
+        # STEP 4: BACKGROUND AUTOMATIC SYNC
+        # --------------------------
         def auto_sync_worker():
             global index, image_paths
             try:
                 print("🔍 [Background Sync] Checking SQLite for new models missing embeddings...")
                 sync_start = time.time()
                 
-                # Przetwarzanie bazy danych SigLIP-em w osobnym wątku
-                message = update_embeddings_from_db(DB_PATH)
+                # Przetwarzanie bazy danych SigLIP-em w osobnym wątku - sesja pobierana z app.state
+                message = update_embeddings_from_db(DB_PATH, app.state.tokenizer, app.state.text_session)
                 print(f"ℹ️ [Background Sync] {message}")
                 
                 # Natychmiastowe załadowanie świeżo wygenerowanych wektorów do działającego RAM-u FastAPI
@@ -121,6 +144,7 @@ async def lifespan(app: FastAPI):
         traceback.print_exc()
 
         app.state.tokenizer = None
+        app.state.text_session = None
 
     yield
 
@@ -130,8 +154,112 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 index, image_paths = None, None  
 
+@app.post("/sync")
+async def sync_faiss_index(request: Request):
+    try:
+        # Pobieramy referencje do silników załadowanych w lifespan przy starcie
+        active_tokenizer = app.state.tokenizer 
+        active_text_session = app.state.text_session
+        
+        # Przekazujemy komplet narzędzi do skryptu bazy danych
+        message = update_embeddings_from_db(str(config.DB_PATH), active_tokenizer, active_text_session)
+        
+        return {"status": "success", "detail": message}
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}
 
-# --- EMBEDDING ENDPOINTS ---
+@app.post("/rebuild-embeddings")
+async def rebuild_embeddings(request_body: RebuildEmbeddingsRequest, request: Request):
+    """
+    Clears selected stored vectors and regenerates them from the current ONNX output selection.
+    Model metadata remains untouched.
+    """
+    global index, image_paths
+
+    try:
+        active_tokenizer = request.app.state.tokenizer
+        active_text_session = request.app.state.text_session
+
+        if active_tokenizer is None or active_text_session is None:
+            raise HTTPException(status_code=500, detail="AI Engine components are uninitialized.")
+
+        reset_message = reset_stored_embeddings(
+            str(config.DB_PATH),
+            reset_images=request_body.images,
+            reset_text=request_body.text,
+        )
+        rebuild_message = update_embeddings_from_db(str(config.DB_PATH), active_tokenizer, active_text_session)
+
+        index, image_paths = load_index_and_paths()
+
+        return {
+            "status": "success",
+            "reset": reset_message,
+            "rebuild": rebuild_message,
+        }
+    except Exception as e:
+        print(f"❌ Rebuild embeddings failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    
+@app.post("/find-similar-images-by-text-metadata")
+def find_similar_images_by_text_metadata(prompt: TextPrompt, request: Request):
+    """Trasa wyszukująca meble WYŁĄCZNIE po wektorach metadanych tekstowych."""
+    print(f"🔎 Received metadata-only text search request: {prompt.text} (top_k={prompt.top_k})")
+    start_time = time.time()
+    
+    try:
+        active_tokenizer = request.app.state.tokenizer
+        active_text_session = request.app.state.text_session
+        
+        if active_tokenizer is None or active_text_session is None:
+            raise HTTPException(status_code=500, detail="AI Models/Tokenizers are not initialized.")
+
+        # Generujemy wektor dla wpisanej frazy użytkownika przy użyciu naszej bezpiecznej metody
+        query_embedding = embed_texts_batch([prompt.text], active_tokenizer, active_text_session)
+        
+        # Wykonujemy wyszukiwanie bezpośrednio w bazie danych SQLite
+        results = search_similar_metadata_only(query_embedding, str(config.DB_PATH), prompt.top_k)
+        
+        elapsed = time.time() - start_time
+        print(f"⏱️ Metadata text search completed in {elapsed:.3f} seconds.")
+        return JSONResponse(content=results)
+        
+    except Exception as e:
+        print(f"❌ Metadata search failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/find-similar-images-by-hybrid-search")
+def find_similar_images_by_hybrid_search(prompt: HybridTextPrompt, request: Request):
+    """Trasa łącząca siłę oka AI (FAISS) oraz rozumu AI (metadane SQLite)."""
+    print(f"🎛️ Received HYBRID search request: {prompt.text} (alpha={prompt.alpha}, top_k={prompt.top_k})")
+    start_time = time.time()
+
+    try:
+        active_tokenizer = request.app.state.tokenizer
+        active_text_session = request.app.state.text_session
+        
+        if active_tokenizer is None or active_text_session is None:
+            raise HTTPException(status_code=500, detail="AI Engine components are uninitialized.")
+
+        # Generujemy wektor zapytania
+        query_embedding = embed_texts_batch([prompt.text], active_tokenizer, active_text_session)
+        
+        # Wywołujemy silnik fuzji wagowej z embedding_store
+        results = search_similar_hybrid(
+            query_embedding=query_embedding,
+            db_path=str(config.DB_PATH),
+            alpha=prompt.alpha,
+            top_k=prompt.top_k
+        )
+        
+        elapsed = time.time() - start_time
+        print(f"⏱️ Hybrid score-fusion search completed in {elapsed:.3f} seconds.")
+        return JSONResponse(content=results)
+        
+    except Exception as e:
+        print(f"❌ Hybrid search failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/get-embedding")
 def get_embedding_endpoint(prompt: TextPrompt, request: Request):
@@ -180,7 +308,7 @@ def update_embeddings_endpoint():
     try:
         
         # 2. Wywołujemy nową funkcję synchronizującą bazę z SigLIP 2 i FAISS
-        message = update_embeddings_from_db(DB_PATH)
+        message = update_embeddings_from_db(DB_PATH, app.state.tokenizer, app.state.text_session)
         
         # 3. Krytyczne: Przeładowujemy indeks w pamięci RAM serwera FastAPI
         global index, image_paths
@@ -239,11 +367,8 @@ def find_similar_images_by_text(prompt: TextPrompt, request: Request):
 
 @app.post("/find-similar-images-by-image")
 async def find_similar_images_by_image(file: UploadFile = File(...), top_k: int = 5):
-    global index, image_paths
     print(f"Received image search request (top_k={top_k})")
     start_time = time.time()
-    if index is None:
-        raise HTTPException(status_code=400, detail="Index not loaded.")
 
     try:
         temp_path = None
@@ -252,10 +377,11 @@ async def find_similar_images_by_image(file: UploadFile = File(...), top_k: int 
             with open(temp_path, "wb") as buffer:
                 buffer.write(await file.read())
 
-            pixel_values = preprocess_image(str(temp_path))
-            image_embedding = get_image_embedding(pixel_values)
+            image_embedding, valid_paths = embed_images_batch([str(temp_path)])
+            if image_embedding.shape[0] == 0 or not valid_paths:
+                raise HTTPException(status_code=400, detail="Could not generate an embedding for the uploaded image.")
             
-            results = search_similar_images(image_embedding, index, image_paths, top_k)
+            results = search_similar_images_from_db(image_embedding, str(config.DB_PATH), top_k)
         finally:
             if temp_path and temp_path.exists():
                 temp_path.unlink()

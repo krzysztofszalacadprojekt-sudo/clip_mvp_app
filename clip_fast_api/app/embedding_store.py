@@ -2,7 +2,7 @@ import faiss
 import numpy as np
 import json
 from pathlib import Path
-from .config import IMAGES_DIR, FAISS_INDEX_PATH, IMAGE_PATHS_LIST, IMAGES_DIR
+from .config import IMAGES_DIR, FAISS_INDEX_PATH, IMAGE_PATHS_LIST
 from PIL import Image
 from typing import List
 import concurrent.futures
@@ -98,66 +98,120 @@ def _get_dynamic_batch_size():
         print(f"Automatyczna detekcja zasobów nie powiodła się ({e}). Powrót do bezpiecznego bezpiecznika = 1.")
         return 1
 
-def embed_images_batch(image_paths: List[str]):
+def embed_images_batch(image_paths: List[str]) -> tuple[np.ndarray, List[str]]:
     """
-    Compute L2-normalized CLIP image embeddings for a list of image paths using batching.
-    Returns a (N, D) numpy array and a list of valid paths.
+    Przetwarza paczkę ścieżek obrazów na embeddingi SigLIP 2 przez ONNX Runtime + DirectML.
+    Bezpiecznie zasila zunifikowane grafy makietami wejść tekstowych i celuje w węzeł wizualny.
     """
+    
+    if not image_paths:
+        return np.empty((0, 768), dtype=np.float32), []
+
+    # Pobieramy instancje sesji (zakładamy, że serwer używa zunifikowanej aktywnej sesji)
+    # W server.py przypisaliśmy ją do app.state.text_session, upewnij się, że masz do niej dostęp
+    # Może to być też wspólna zmienna globalna shared_session z clip_model
+    from .clip_model import _get_active_session
+    session = _get_active_session("visual") 
+
+    expected_inputs = [node.name for node in session.get_inputs()]
+    expected_outputs = [node.name for node in session.get_outputs()]
+
+    if "image_embeds" in expected_outputs:
+        target_output = "image_embeds"
+    else:
+        target_output = expected_outputs[0]
+        for output_name in expected_outputs:
+            name_lower = output_name.lower()
+            if (
+                ("embed" in name_lower or "feature" in name_lower)
+                and ("image" in name_lower or "vision" in name_lower)
+            ):
+                target_output = output_name
+                break
+
+    batch_size = max(1, min(_get_dynamic_batch_size(), 32))
     feats = []
     valid_paths = []
 
-    batch_size = _get_dynamic_batch_size()
-    total_images = len(image_paths)
-    processed_images = 0
-    print(f"Starting to process {total_images} images in batches of up to {batch_size}...")
-
-    def load_image(p):
-        try:
-            # 'with' ensures file handles are closed eagerly. 
-            # 'convert' forces the pixel data to be fully loaded into memory.
-            with Image.open(p) as img:
-                img_rgb = img.convert("RGB")
-            return p, img_rgb, str(Path(p).expanduser().resolve())
-        except Exception as e:
-            print(f"Skipping {p}: {e}")
-            return p, None, None
-
-    image_preprocessor._init_processor()
-
-    # Process chunks one by one so we don't load thousands of images into RAM at once
-    for i in range(0, len(image_paths), batch_size):
-        chunk_paths = image_paths[i : i + batch_size]
+    def run_small_batch(batch_paths: List[str]) -> tuple[np.ndarray, List[str]]:
         batch_imgs = []
         batch_valid_paths = []
 
-        # Load only the current batch of images using threads
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            for p, img, resolved_path in executor.map(load_image, chunk_paths):
-                if img is not None:
-                    batch_imgs.append(img)
-                    batch_valid_paths.append(resolved_path)
+        for p in batch_paths:
+            try:
+                if not Path(p).exists():
+                    continue
 
-        if batch_imgs:
-            inputs = image_preprocessor.processor(images=batch_imgs, return_tensors="np")
-            image_features = get_image_embeddings_batch(inputs["pixel_values"])
-            faiss.normalize_L2(image_features)
+                with Image.open(p) as img:
+                    batch_imgs.append(img.convert("RGB"))
+                batch_valid_paths.append(str(p))
+            except Exception as img_err:
+                print(f"Nie można wczytać obrazu {p}: {img_err}")
+
+        if not batch_imgs:
+            return np.empty((0, 768), dtype=np.float32), []
+
+        if image_preprocessor.processor is None:
+            image_preprocessor._init_processor()
+
+        inputs = image_preprocessor.processor(images=batch_imgs, return_tensors="np")
+
+        onnx_inputs = {
+            "pixel_values": inputs["pixel_values"].astype(np.float32)
+        }
+
+        if "input_ids" in expected_inputs:
+            onnx_inputs["input_ids"] = np.zeros((len(batch_valid_paths), 64), dtype=np.int64)
             
-            feats.append(image_features)
+        if "attention_mask" in expected_inputs:
+            onnx_inputs["attention_mask"] = np.ones((len(batch_valid_paths), 64), dtype=np.int64)
+
+        raw_outputs = session.run([target_output], onnx_inputs)
+        image_features = raw_outputs[0]
+
+        if image_features.ndim == 2 and image_features.shape[0] != len(batch_valid_paths) and image_features.shape[1] == len(batch_valid_paths):
+            image_features = image_features.T
+        if image_features.ndim != 2 or image_features.shape[0] != len(batch_valid_paths):
+            raise ValueError(
+                f"Selected image output '{target_output}' has invalid shape {image_features.shape}; "
+                f"expected ({len(batch_valid_paths)}, embedding_dim)."
+            )
+
+        norms = np.linalg.norm(image_features, axis=-1, keepdims=True)
+        normalized_features = image_features / np.where(norms == 0, 1e-12, norms)
+
+        return normalized_features.astype(np.float32), batch_valid_paths
+
+    for i in range(0, len(image_paths), batch_size):
+        batch_paths = image_paths[i : i + batch_size]
+        try:
+            batch_embeddings, batch_valid_paths = run_small_batch(batch_paths)
+        except Exception as batch_err:
+            if len(batch_paths) == 1:
+                print(f"Pominięto obraz po błędzie ONNX {batch_paths[0]}: {repr(batch_err)}")
+                continue
+
+            print(f"Batch obrazów {i + 1}-{i + len(batch_paths)} nie zmieścił się w pamięci. Schodzę do pojedynczych obrazów.")
+            for single_path in batch_paths:
+                try:
+                    batch_embeddings, batch_valid_paths = run_small_batch([single_path])
+                except Exception as single_err:
+                    print(f"Pominięto obraz po błędzie ONNX {single_path}: {repr(single_err)}")
+                    continue
+
+                if batch_embeddings.shape[0] > 0:
+                    feats.append(batch_embeddings)
+                    valid_paths.extend(batch_valid_paths)
+            continue
+
+        if batch_embeddings.shape[0] > 0:
+            feats.append(batch_embeddings)
             valid_paths.extend(batch_valid_paths)
-            
-            # Explicitly free memory before loading the next chunk
-            del batch_imgs
-            del inputs
-            
-        processed_images += len(chunk_paths)
-        progress_percent = (processed_images / total_images) * 100
-        print(f"Progress: {processed_images}/{total_images} images processed ({progress_percent:.1f}%)")
 
     if not feats:
-        return np.zeros((0, 0), dtype=np.float32), []
+        return np.empty((0, 768), dtype=np.float32), []
 
-    feats = np.concatenate(feats, axis=0).astype(np.float32)
-    return feats, valid_paths
+    return np.concatenate(feats, axis=0).astype(np.float32), valid_paths
 
 def create_and_save_embeddings(image_paths: List[str] = None):
     """
@@ -405,145 +459,495 @@ def update_embeddings(directories: List[str]):
         f"{len(valid_new_paths)} new images."
     )
 
-def update_embeddings_from_db(db_path: str) -> str:
-    """
-    Lekka, produkcyjna pętla uzgadniania stanu dla ścieżek względnych.
-    Gwarantuje relację 1-do-wielu bez dublowania pracy SigLIP 2.
-    """
-    print("\n=== SYSTEM SYNCHRONIZACJI PRODUKCYJNEJ (Ścieżki Względne) ===")
-    start_check = time.time()
-    CHECKPOINT_SIZE = 1000
+def _resolve_db_image_path(db_path_value: str) -> Path:
+    """Return an absolute image path for a path stored in SQLite."""
+    path_obj = Path(db_path_value)
+    if path_obj.is_absolute():
+        return path_obj
+    return IMAGES_DIR / path_obj
 
-    # 1. Odczyt aktualnego stanu relatywnego z dysku
-    index, image_paths_list = load_index_and_paths()
-    if image_paths_list is None:
-        image_paths_list = []
-    existing_paths = set(image_paths_list)
+
+def _safe_json_vector(raw_value: str) -> np.ndarray | None:
+    if not raw_value:
+        return None
+    try:
+        return np.array(json.loads(raw_value), dtype=np.float32)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        print(f"Skipping corrupt vector from SQLite: {exc}")
+        return None
+
+
+def _minmax(values: np.ndarray) -> np.ndarray:
+    if values.size == 0:
+        return values
+    min_v = values.min()
+    max_v = values.max()
+    span = max_v - min_v
+    if span <= 1e-12:
+        return np.zeros_like(values, dtype=np.float32)
+    return (values - min_v) / span
+
+
+def _normalized_flat_vector(vector: np.ndarray) -> np.ndarray:
+    flat = vector.astype("float32").flatten()
+    norm = np.linalg.norm(flat)
+    if norm > 1e-12:
+        return flat / norm
+    return flat
+
+
+def reset_stored_embeddings(db_path: str, reset_images: bool = True, reset_text: bool = True) -> str:
+    """
+    Clears only stored embedding vectors and flags. Metadata/model rows stay intact.
+    The next update_embeddings_from_db run will regenerate cleared vectors.
+    """
+    if not reset_images and not reset_text:
+        return "No embedding columns selected for reset."
+
+    assignments = []
+    if reset_images:
+        assignments.extend(["image_vector = NULL", "image_embedding_exists = 0"])
+    if reset_text:
+        assignments.extend(["text_vector = NULL", "text_embedding_exists = 0"])
+
+    conn = sqlite3.connect(db_path)
+    try:
+        cursor = conn.cursor()
+        cursor.execute(f"UPDATE models SET {', '.join(assignments)}")
+        affected = cursor.rowcount
+        conn.commit()
+        return f"Reset embedding columns for {affected} model rows."
+    except sqlite3.Error:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def search_similar_metadata_only(query_embedding: np.ndarray, db_path: str, top_k: int = 5) -> list:
+    """
+    Wyszukuje meble wyłącznie na podstawie podobieństwa semantycznego do metadanych tekstowych z SQLite.
+    Ignoruje indeks FAISS (obrazki).
+    """
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    
+    # Pobieramy z bazy wszystkie modele, które posiadają wygenerowany wektor tekstu
+    cursor.execute("""
+        SELECT id, name, manufacturer, jpg_path, text_vector
+        FROM models
+        WHERE text_vector IS NOT NULL AND jpg_path IS NOT NULL
+    """)
+    rows = cursor.fetchall()
+    conn.close()
+    
+    if not rows:
+        return []
+        
+    results = []
+    q_vec = _normalized_flat_vector(query_embedding)
+    
+    for row in rows:
+        # Dekodujemy zapisany ciąg JSON z bazy z powrotem do tablicy NumPy
+        t_vec = _safe_json_vector(row["text_vector"])
+        if t_vec is None:
+            continue
+        t_vec = _normalized_flat_vector(t_vec)
+        
+        # Obliczamy podobieństwo cosinusowe (iloczyn skalarny dla wektorów znormalizowanych L2)
+        similarity = float(np.dot(q_vec, t_vec))
+        
+        path_to_add = _resolve_db_image_path(row["jpg_path"])
+        results.append({
+            "id": row["id"],
+            "name": row["name"],
+            "manufacturer": row["manufacturer"],
+            "path": str(path_to_add),
+            "distance": similarity  # W naszej architekturze 'distance' to miara podobieństwa (im więcej tym lepiej)
+        })
+        
+    # Sortujemy od najwyższego podobieństwa tekstowego
+    results.sort(key=lambda x: x["distance"], reverse=True)
+    return results[:top_k]
+
+def search_similar_images_from_db(query_embedding: np.ndarray, db_path: str, top_k: int = 5) -> list:
+    """
+    Search image embeddings stored in SQLite. This is the source of truth for
+    add/delete workflows; FAISS can still exist as a rebuildable cache.
+    """
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT id, name, manufacturer, jpg_path, image_vector
+        FROM models
+        WHERE image_vector IS NOT NULL AND jpg_path IS NOT NULL
+    """)
+    rows = cursor.fetchall()
+    conn.close()
+
+    q_vec = _normalized_flat_vector(query_embedding)
+    results = []
+
+    for row in rows:
+        image_vec = _safe_json_vector(row["image_vector"])
+        if image_vec is None:
+            continue
+        image_vec = _normalized_flat_vector(image_vec)
+
+        results.append({
+            "id": row["id"],
+            "name": row["name"],
+            "manufacturer": row["manufacturer"],
+            "path": str(_resolve_db_image_path(row["jpg_path"])),
+            "distance": float(np.dot(q_vec, image_vec)),
+        })
+
+    results.sort(key=lambda x: x["distance"], reverse=True)
+    return results[:top_k]
+
+
+def search_similar_hybrid(query_embedding: np.ndarray, db_path: str, alpha: float = 0.35, top_k: int = 5) -> list:
+    """
+    Wyszukiwanie hybrydowe z dynamicznym skalowaniem Min-Max dla obu modalności.
+    Sprowadza wyniki tekstu i obrazu do przedziału [0, 1] przed nałożeniem wag Alpha/Beta.
+    """
+    alpha = max(0.0, min(1.0, float(alpha)))
+    beta = 1.0 - alpha
+    query_embedding = query_embedding.astype('float32')
+    faiss.normalize_L2(query_embedding)
 
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT id, name, manufacturer, jpg_path, image_vector, text_vector
+        FROM models
+        WHERE jpg_path IS NOT NULL
+          AND (image_vector IS NOT NULL OR text_vector IS NOT NULL)
+    """)
+    rows = cursor.fetchall()
+    conn.close()
     
-    path_groups = {}
-    images_to_embed = []
-    healed_to_exists = 0
-    healed_to_missing = 0
+    if not rows:
+        return []
+        
+    raw_text_scores = []
+    raw_image_scores = []
+    metadata_list = []
+    
+    q_vec = _normalized_flat_vector(query_embedding)
+    
+    for row in rows:
+        t_vec = _safe_json_vector(row["text_vector"])
+        i_vec = _safe_json_vector(row["image_vector"])
+
+        score_text = float(np.dot(q_vec, _normalized_flat_vector(t_vec))) if t_vec is not None else 0.0
+        score_image = float(np.dot(q_vec, _normalized_flat_vector(i_vec))) if i_vec is not None else 0.0
+        
+        raw_text_scores.append(score_text)
+        raw_image_scores.append(score_image)
+        metadata_list.append({
+            "id": row["id"],
+            "name": row["name"],
+            "manufacturer": row["manufacturer"],
+            "path": row["jpg_path"]
+        })
+
+    np_text = np.array(raw_text_scores, dtype=np.float32)
+    np_image = np.array(raw_image_scores, dtype=np.float32)
+
+    norm_text_scores = _minmax(np_text)
+    norm_image_scores = _minmax(np_image)
+    final_hybrid_scores = (alpha * norm_image_scores) + (beta * norm_text_scores)
+
+    results = []
+    for idx, meta in enumerate(metadata_list):
+        path_to_add = _resolve_db_image_path(meta["path"])
+        results.append({
+            "id": meta["id"],
+            "name": meta["name"],
+            "manufacturer": meta["manufacturer"],
+            "path": str(path_to_add),
+            "distance": float(final_hybrid_scores[idx]), # Wykorzystywane przez C++ jako miara dopasowania
+            "debug_image_score_raw": float(np_image[idx]),
+            "debug_text_score_raw": float(np_text[idx])
+        })
+        
+    results.sort(key=lambda x: x["distance"], reverse=True)
+    return results[:top_k]
+
+def embed_texts_batch(texts: List[str], tokenizer, text_session) -> np.ndarray:
+    """
+    Koduje paczkę tekstów na embeddingi SigLIP 2.
+    Powrót do klasycznego, przewidywalnego wyciągania węzłów wyjściowych z sesji ONNX.
+    """
+    if not texts:
+        return np.empty((0, 768), dtype=np.float32)
+
+    MICRO_BATCH_SIZE = 32
+    all_features = []
+
+    # 1. Pobieramy surowe nazwy wejść i wyjść dokładnie tak, jak widzi je sesja ONNX
+    expected_inputs = [node.name for node in text_session.get_inputs()]
+    expected_outputs = [node.name for node in text_session.get_outputs()]
+
+    # 🚀 JAWNA DIAGNOSTYKA: Zobaczysz w konsoli dokładne nazwy wyjść Twojego modelu
+    print(f"📊 [ONNX DIAGNOSTIC] Wykryte węzły wyjściowe w modelu: {expected_outputs}")
+
+    # 2. Powrót do starej logiki: Wybieramy właściwy węzeł bez przekombinowanych automatów
+    if "text_embeds" in expected_outputs:
+        target_output = "text_embeds"
+    elif len(expected_outputs) > 1:
+        target_output = next(
+            (
+                output_name for output_name in expected_outputs
+                if "text" in output_name.lower() and ("embed" in output_name.lower() or "feature" in output_name.lower())
+            ),
+            expected_outputs[1],
+        )
+    else:
+        target_output = expected_outputs[0]
+
+    print(f"🎯 Celowanie zablokowane na węźle: '{target_output}'")
 
     try:
-        cursor = conn.cursor()
+        from . import image_preprocessor
+        from PIL import Image
         
-        # Pobieramy wszystkie ścieżki z bazy (które są już relatywne)
-        cursor.execute("SELECT id, name, jpg_path, image_embedding_exists FROM models WHERE jpg_path IS NOT NULL")
-        rows = cursor.fetchall()
+        if image_preprocessor.processor is None:
+            image_preprocessor._init_processor()
+            
+        dummy_img = Image.new("RGB", (10, 10))
+        dummy_features = image_preprocessor.processor(images=[dummy_img], return_tensors="np")
+        actual_vision_shape = dummy_features["pixel_values"].shape
 
+        # 3. Pętla przetwarzania (Micro-batching chroniący przed brakiem pamięci VRAM)
+        for b in range(0, len(texts), MICRO_BATCH_SIZE):
+            chunk_texts = texts[b : b + MICRO_BATCH_SIZE]
+            
+            inputs = tokenizer(
+                chunk_texts, 
+                padding=True, 
+                truncation=True, 
+                max_length=64, 
+                return_tensors="np"
+            )
+
+            # Mapowanie wejść
+            onnx_inputs = {
+                "input_ids": inputs["input_ids"].astype(np.int64)
+            }
+
+            if "attention_mask" in expected_inputs:
+                if "attention_mask" in inputs:
+                    onnx_inputs["attention_mask"] = inputs["attention_mask"].astype(np.int64)
+                else:
+                    onnx_inputs["attention_mask"] = np.ones_like(inputs["input_ids"]).astype(np.int64)
+            
+            if "pixel_values" in expected_inputs:
+                dummy_shape = [len(chunk_texts), actual_vision_shape[1], actual_vision_shape[2], actual_vision_shape[3]]
+                onnx_inputs["pixel_values"] = np.zeros(dummy_shape, dtype=np.float32)
+
+            # 🚀 KLASYCZNE WYWOŁANIE: Odpytujemy stabilnie jeden, konkretny węzeł tekstowy
+            raw_outputs = text_session.run([target_output], onnx_inputs)
+            text_features = raw_outputs[0]
+            if text_features.ndim != 2 or text_features.shape[0] != len(chunk_texts):
+                raise ValueError(
+                    f"Selected text output '{target_output}' has invalid shape {text_features.shape}; "
+                    f"expected ({len(chunk_texts)}, embedding_dim)."
+                )
+
+            # Normalizacja L2 (Krytyczna do wyszukiwania cosinusowego)
+            norms = np.linalg.norm(text_features, axis=-1, keepdims=True)
+            normalized_features = text_features / np.where(norms == 0, 1e-12, norms)
+            
+            all_features.append(normalized_features)
+
+        return np.concatenate(all_features, axis=0).astype(np.float32)
+
+    except Exception as e:
+        print(f"❌ [KRYTYCZNY BŁĄD AI] Awaria w embed_texts_batch: {e}")
+        raise e
+    
+def update_embeddings_from_db(db_path: str, tokenizer, text_session) -> str:
+    """
+    Ujednolicona, pancerne pętla synchronizacji.
+    Sprowadza wszystkie ścieżki (z bazy, FAISS i AI) do pełnego stanu bezwzględnego (Absolute Lowercase),
+    eliminując błędy mapowania Windowsa raz na zawsze.
+    """
+    print("\n=== SYSTEM SYNCHRONIZACJI MULTIMODALNEJ (Pełna Normalizacja Ścieżek) ===")
+    start_time = time.time()
+    CHECKPOINT_SIZE = 1024
+
+    # 1. Odczyt i konwersja istniejącego cache FAISS do pełnych ścieżek lowercase
+    index, image_paths_list = load_index_and_paths()
+    if image_paths_list is None:
+        image_paths_list = []
+    
+    normalized_existing_faiss = set()
+    for p in image_paths_list:
+        try:
+            p_obj = Path(p)
+            if not p_obj.is_absolute():
+                p_obj = IMAGES_DIR / p_obj
+            normalized_existing_faiss.add(str(p_obj.resolve()).lower())
+        except Exception:
+            pass
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    image_processed_count = 0
+    text_processed_count = 0
+
+    try:
+        # =====================================================================
+        # FAZA 1: PRZETWARZANIE OBRAZÓW
+        # =====================================================================
+        cursor.execute("""
+            SELECT id, jpg_path, image_embedding_exists, image_vector
+            FROM models
+            WHERE jpg_path IS NOT NULL
+        """)
+        rows = cursor.fetchall()
+        
         if not rows:
+            conn.close()
             return "Baza danych SQLite jest pusta."
 
-        # KROK A: Grupowanie po ścieżkach względnych z uwzględnieniem IMAGES_DIR
-        with conn:
-            for row in rows:
-                model_id = row["id"]
-                db_flag = row["image_embedding_exists"]
-                rel_path = row["jpg_path"].strip()
-
-                # Poprawka rozszerzenia, jeśli baza go nie miała
-                p_rel = Path(rel_path)
-                if not p_rel.suffix:
-                    p_rel = p_rel.with_suffix(".jpg")
-                    rel_path = str(p_rel)
-
-                # 🚀 SPRAWDZENIE: Łączymy bazę klienta ze ścieżką względną
-                if (IMAGES_DIR / rel_path).exists():
-                    # 🎯 KLUCZEM w słowniku staje się unikalna ścieżka WZGLĘDNA
-                    if rel_path not in path_groups:
-                        path_groups[rel_path] = []
-                    path_groups[rel_path].append({"id": model_id, "flag": db_flag})
-
+        path_groups = {}
+        images_to_embed = set() # Set zapobiega dublowaniu identycznych ścieżek systemowych
         
-        normalized_existing = {p.lower() for p in image_paths_list}
-                
-        with conn:
-            for rel_path, models in path_groups.items():
-                # 2. Ścieżkę z bazy danych przed testem "in" traktujemy dokładnie tak samo
-                lookup_path = rel_path.lower()
-
-                # Teraz dopasowanie zadziała zawsze, niezależnie od formatu pliku
-                is_in_faiss = lookup_path in normalized_existing
-                
-                for m in models:
-                    if is_in_faiss and m["flag"] == 0:
-                        cursor.execute("UPDATE models SET image_embedding_exists = 1 WHERE id = ?", (m["id"],))
-                        healed_to_exists += 1
-                    elif not is_in_faiss and m["flag"] == 1:
-                        cursor.execute("UPDATE models SET image_embedding_exists = 0 WHERE id = ?", (m["id"],))
-                        healed_to_missing += 1
-                
-                if not is_in_faiss:
-                    images_to_embed.append(rel_path)
-
-        print(f"⏱️ Weryfikacja spójności unikalnych zasobów zakończona w {time.time() - start_check:.4f}s.")
-        print(f"📊 Statystyki struktury: Wykryto {len(path_groups)} unikalnych zdjęć dla {len(rows)} modeli bazy.")
-        
-        if healed_to_exists > 0 or healed_to_missing > 0:
-            print(f"⚡ [Self-Healing] Dostrojono flagi: oznaczono jako istniejące: {healed_to_exists}, zresetowano: {healed_to_missing}")
-
-        total_images_to_process = len(images_to_embed)
-        if total_images_to_process == 0:
-            return "Wszystkie systemy są w harmonii. Indeks FAISS (Względny) i baza SQLite są idealnie zsynchronizowane."
-
-        print(f"🚀 Do faktycznego przetworzenia przez SigLIP 2 pozostało: {total_images_to_process} UNIKALNYCH obrazów.")
-        print(f"💾 Punkty kontrolne (Checkpoints) zabezpieczą dysk co {CHECKPOINT_SIZE} zdjęć.")
-
-        # --- GŁÓWNA PĘTLA BLOKOWA DLA EMBEDDINGÓW ---
-        checkpoint_count = 0
-        for i in range(0, total_images_to_process, CHECKPOINT_SIZE):
-            chunk_paths = images_to_embed[i : i + CHECKPOINT_SIZE]
-            current_block_num = (i // CHECKPOINT_SIZE) + 1
-            total_blocks = (total_images_to_process + CHECKPOINT_SIZE - 1) // CHECKPOINT_SIZE
-            
-            print(f"\n📦 [Blok {current_block_num}/{total_blocks}] Przetwarzanie partii {len(chunk_paths)} unikalnych zdjęć...")
-            
-            # 🚀 KLUCZOWE: Budujemy ścieżki absolutne TYLKO dla modelu AI, żeby mógł otworzyć plik obrazu
-            absolute_chunk_paths = [str((IMAGES_DIR / p).resolve()) for p in chunk_paths]
-            
-            new_embeddings, valid_absolute_paths = embed_images_batch(absolute_chunk_paths)
-            
-            if new_embeddings.shape[0] == 0 or not valid_absolute_paths:
+        for row in rows:
+            rel_path = row["jpg_path"].strip()
+            if not rel_path:
                 continue
+                
+            p_rel = Path(rel_path)
+            if not p_rel.suffix:
+                p_rel = p_rel.with_suffix(".jpg")
 
-            # 🚀 KLUCZOWE: Po powrocie z AI, obcinamy przedrostek z powrotem do formatu względnego dla pliku JSON
-            valid_relative_paths = [str(Path(p).relative_to(IMAGES_DIR)) for p in valid_absolute_paths]
+            # 🚀 KLUCZ: Tworzymy pełną, bezwzględną ścieżkę systemową dla Windowsa
+            if p_rel.is_absolute():
+                full_path = p_rel.resolve()
+            else:
+                full_path = (IMAGES_DIR / p_rel).resolve()
 
-            if index is None:
-                index = faiss.IndexFlatIP(new_embeddings.shape[1])
-            
-            index.add(new_embeddings)
-            image_paths_list.extend(valid_relative_paths)
+            if full_path.exists():
+                # Jako klucza używamy absolutnego, rozwiązanego stringu lowercase
+                norm_key = str(full_path).lower()
+                
+                if norm_key not in path_groups:
+                    path_groups[norm_key] = []
+                path_groups[norm_key].append({"id": row["id"], "flag": row["image_embedding_exists"]})
+                
+                needs_db_vector = not row["image_vector"]
+                if row["image_vector"] and row["image_embedding_exists"] == 0:
+                    cursor.execute("UPDATE models SET image_embedding_exists = 1 WHERE id = ?", (row["id"],))
 
-            # Zapis indeksu .bin
-            tmp_index = str(FAISS_INDEX_PATH) + ".tmp"
-            faiss.write_index(index, tmp_index)
-            os.replace(tmp_index, str(FAISS_INDEX_PATH))
-            
-            # Zapis ścieżek .json (Tylko czyste ścieżki względne!)
-            tmp_json = str(IMAGE_PATHS_LIST) + ".tmp"
-            with open(tmp_json, "w", encoding="utf-8") as f:
-                json.dump(image_paths_list, f, ensure_ascii=False, indent=2)
-            os.replace(tmp_json, IMAGE_PATHS_LIST)
+                if needs_db_vector:
+                    images_to_embed.add(str(full_path))
 
-            # Masowa aktualizacja flag '1' w SQLite dla wszystkich powiązanych modeli
-            with conn:
-                for rel_path in valid_relative_paths:
-                    associated_models = path_groups.get(rel_path, [])
-                    for m in associated_models:
-                        cursor.execute("UPDATE models SET image_embedding_exists = 1 WHERE id = ?", (m["id"],))
+        images_to_embed = list(images_to_embed)
+        total_images = len(images_to_embed)
+        
+        if total_images > 0:
+            print(f"📸 Wykryto {total_images} nowych unikalnych obrazów do przetworzenia.")
+            for i in range(0, total_images, CHECKPOINT_SIZE):
+                chunk_paths = images_to_embed[i : i + CHECKPOINT_SIZE]
+                
+                # chunk_paths są już pełnymi ścieżkami absolutnymi, nie musimy ich dotykać
+                new_img_embeddings, valid_absolute_paths = embed_images_batch(chunk_paths)
+                
+                if new_img_embeddings.shape[0] > 0 and valid_absolute_paths:
+                    if index is None:
+                        index = faiss.IndexFlatIP(new_img_embeddings.shape[1])
 
-            checkpoint_count += len(valid_relative_paths)
-            print(f"🔒 [Checkpoint Zablokowany] Postęp zapisu unikalnych: {i + len(chunk_paths)} / {total_images_to_process}")
+                    faiss_embeddings_to_add = []
 
-        return f"Synchronizacja udana. Przetworzono unikalnych obrazów: {checkpoint_count}."
+                    for idx, abs_path_str in enumerate(valid_absolute_paths):
+                        # Konwertujemy ścieżkę zwróconą z AI na nasz wspólny mianownik (abs lowercase)
+                        lookup_key = str(Path(abs_path_str).resolve()).lower()
+                        
+                        if lookup_key not in normalized_existing_faiss:
+                            try:
+                                rel_path_faiss = str(Path(abs_path_str).relative_to(IMAGES_DIR))
+                            except ValueError:
+                                rel_path_faiss = abs_path_str
 
-    except sqlite3.Error as e:
-        print(f"❌ Krytyczny błąd bazy danych podczas pętli produkcyjnej V5: {e}")
+                            image_paths_list.append(rel_path_faiss)
+                            normalized_existing_faiss.add(lookup_key)
+                            faiss_embeddings_to_add.append(new_img_embeddings[idx])
+                        
+                        # Mapowanie i aktualizacja rekordów w SQLite
+                        vector_json = json.dumps(new_img_embeddings[idx].tolist())
+                        associated_models = path_groups.get(lookup_key, [])
+                        
+                        for m in associated_models:
+                            cursor.execute("""
+                                UPDATE models 
+                                SET image_vector = ?, image_embedding_exists = 1 
+                                WHERE id = ?
+                            """, (vector_json, m["id"]))
+                            image_processed_count += 1
+
+                    if faiss_embeddings_to_add:
+                        index.add(np.asarray(faiss_embeddings_to_add, dtype=np.float32))
+                
+                # Zapis i twardy commit paczki na dysk
+                if index is not None:
+                    faiss.write_index(index, str(FAISS_INDEX_PATH))
+                with open(IMAGE_PATHS_LIST, "w", encoding="utf-8") as f:
+                    json.dump(image_paths_list, f, ensure_ascii=False, indent=2)
+                conn.commit()
+                print(f"🔒 [Checkpoint Obrazów] Zapisano partię na dysku. Łącznie zaktualizowano: {image_processed_count} modeli CAD.")
+
+        conn.commit()
+
+        # =====================================================================
+        # FAZA 2: PRZETWARZANIE TEKSTÓW (Bez żadnego śladu po 'category'!)
+        # =====================================================================
+        cursor.execute("""
+            SELECT id, name, manufacturer, opis_produktu, grupa, typ, typ_standardowy
+            FROM models 
+            WHERE text_embedding_exists = 0 OR text_vector IS NULL
+        """)
+        text_rows = cursor.fetchall()
+
+        total_texts = len(text_rows)
+        if total_texts > 0:
+            print(f"📝 Przetwarzanie {total_texts} opisów tekstowych przez DirectML...")
+            for i in range(0, total_texts, CHECKPOINT_SIZE):
+                chunk_rows = text_rows[i : i + CHECKPOINT_SIZE]
+                
+                prompts_chunk = []
+                for r in chunk_rows:
+                    p_text = f"Produkt: {r['name'] or ''}. Producent: {r['manufacturer'] or ''}. Opis: {r['opis_produktu'] or ''}. Grupa: {r['grupa'] or ''}. Typ: {r['typ'] or ''}. Typ standardowy: {r['typ_standardowy'] or ''}."
+                    prompts_chunk.append(p_text.strip())
+                
+                new_text_embeddings = embed_texts_batch(prompts_chunk, tokenizer, text_session) 
+                
+                for idx, r in enumerate(chunk_rows):
+                    text_vector_json = json.dumps(new_text_embeddings[idx].tolist())
+                    cursor.execute("""
+                        UPDATE models 
+                        SET text_vector = ?, text_embedding_exists = 1 
+                        WHERE id = ?
+                    """, (text_vector_json, r["id"]))
+                    text_processed_count += 1
+                
+                conn.commit()
+                print(f"🔒 [Zapis tekstów] Postęp: {i + len(chunk_rows)} / {total_texts}")
+
+        duration = time.time() - start_time
+        return f"🏁 Sukces! Zapisano w bazie obrazów: {image_processed_count}, tekstów: {text_processed_count} (Czas: {duration:.2f}s)."
+
+    except Exception as e:
+        print(f"❌ Krytyczny błąd podczas pracy skryptu: {e}")
+        conn.rollback()
         raise
     finally:
         conn.close()

@@ -2,6 +2,7 @@
 """
 Moduł zarządzania lokalną bazą danych SQLite dla systemu wyszukiwania modeli 3D.
 Kompatybilny z systemem Windows, używa ścieżek relatywnych/absolutnych przez pathlib.
+Wzbogacony o trwały magazyn wektorów (embeddings) dla obrazów i tekstu.
 """
 
 import csv
@@ -28,19 +29,22 @@ def create_database(db_path: str) -> None:
     db_file = Path(db_path)
     db_file.parent.mkdir(parents=True, exist_ok=True)
 
+    # 1. ZAKTUALIZOWANA STRUKTURA: Dodano nowe kolumny tekstowe z CSV
     query_table = """
     CREATE TABLE IF NOT EXISTS models (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT,
         manufacturer TEXT,
-        category TEXT,
+        opis_produktu TEXT,
+        grupa TEXT,
+        typ TEXT,
+        typ_standardowy TEXT,
         jpg_path TEXT,
         dwx_path TEXT UNIQUE,
-        width_mm INTEGER,
-        depth_mm INTEGER,
-        height_mm INTEGER,
         image_embedding_exists INTEGER DEFAULT 0,
         text_embedding_exists INTEGER DEFAULT 0,
+        image_vector TEXT,  -- Trwały cache wektora obrazu (Zserializowany JSON string)
+        text_vector TEXT,   -- Trwały cache wektora tekstu (Zserializowany JSON string)
         last_modified TEXT
     );
     """
@@ -49,7 +53,6 @@ def create_database(db_path: str) -> None:
     indexes = [
         "CREATE INDEX IF NOT EXISTS idx_models_dwx_path ON models(dwx_path);",
         "CREATE INDEX IF NOT EXISTS idx_models_manufacturer ON models(manufacturer);",
-        "CREATE INDEX IF NOT EXISTS idx_models_category ON models(category);",
     ]
 
     conn = sqlite3.connect(str(db_file))
@@ -69,22 +72,24 @@ def create_database(db_path: str) -> None:
 def _execute_upsert(cursor: sqlite3.Cursor, model_data: Dict[str, Any]) -> None:
     """
     Wewnętrzna funkcja pomocnicza realizująca zapytanie UPSERT na otwartym kursorze.
+    Bezpiecznie dba o to, by nie wyczyścić istniejących wektorów przy braku danych wejściowych.
     """
     now_iso = datetime.datetime.now().isoformat()
 
-    # Przygotowanie pełnego słownika danych z wartościami domyślnymi
+    # 2. MAPOWANIE SŁOWNIKA: Przekazujemy nowe kolumny z zachowaniem spójnego snake_case
     full_data = {
-        "id": model_data.get("id"),
         "name": model_data.get("name"),
         "manufacturer": model_data.get("manufacturer"),
-        "category": model_data.get("category"),
+        "opis_produktu": model_data.get("opis_produktu"),
+        "grupa": model_data.get("grupa"),
+        "typ": model_data.get("typ"),
+        "typ_standardowy": model_data.get("typ_standardowy"),
         "jpg_path": model_data.get("jpg_path"),
         "dwx_path": model_data.get("dwx_path"),
-        "width_mm": model_data.get("width_mm"),
-        "depth_mm": model_data.get("depth_mm"),
-        "height_mm": model_data.get("height_mm"),
-        "image_embedding_exists": model_data.get("image_embedding_exists", 0),
-        "text_embedding_exists": model_data.get("text_embedding_exists", 0),
+        "image_embedding_exists": model_data.get("image_embedding_exists"),
+        "text_embedding_exists": model_data.get("text_embedding_exists"),
+        "image_vector": model_data.get("image_vector"),
+        "text_vector": model_data.get("text_vector"),
         "last_modified": model_data.get("last_modified", now_iso),
     }
 
@@ -92,25 +97,30 @@ def _execute_upsert(cursor: sqlite3.Cursor, model_data: Dict[str, Any]) -> None:
         logger.warning("Pominięto rekord: brak kluczowej wartości 'dwx_path'.")
         return
 
+    # 3. ZAKTUALIZOWANA KWERENDA SQL: Dodano obsługę nowych pól w sekcjach INSERT oraz DO UPDATE
     query = """
     INSERT INTO models (
-        id, name, manufacturer, category, jpg_path, dwx_path,
-        width_mm, depth_mm, height_mm, image_embedding_exists,
-        text_embedding_exists, last_modified
+        name, manufacturer, opis_produktu, grupa, typ, typ_standardowy,
+        jpg_path, dwx_path, image_embedding_exists,
+        text_embedding_exists, image_vector, text_vector, last_modified
     ) VALUES (
-        :id, :name, :manufacturer, :category, :jpg_path, :dwx_path,
-        :width_mm, :depth_mm, :height_mm, :image_embedding_exists,
-        :text_embedding_exists, :last_modified
+        :name, :manufacturer, :opis_produktu, :grupa, :typ, :typ_standardowy,
+        :jpg_path, :dwx_path,
+        COALESCE(:image_embedding_exists, 0), 
+        COALESCE(:text_embedding_exists, 0), 
+        :image_vector, :text_vector, :last_modified
     ) ON CONFLICT(dwx_path) DO UPDATE SET
         name = COALESCE(:name, name),
         manufacturer = COALESCE(:manufacturer, manufacturer),
-        category = COALESCE(:category, category),
+        opis_produktu = COALESCE(:opis_produktu, opis_produktu),
+        grupa = COALESCE(:grupa, grupa),
+        typ = COALESCE(:typ, typ),
+        typ_standardowy = COALESCE(:typ_standardowy, typ_standardowy),
         jpg_path = COALESCE(:jpg_path, jpg_path),
-        width_mm = COALESCE(:width_mm, width_mm),
-        depth_mm = COALESCE(:depth_mm, depth_mm),
-        height_mm = COALESCE(:height_mm, height_mm),
         image_embedding_exists = COALESCE(:image_embedding_exists, image_embedding_exists),
         text_embedding_exists = COALESCE(:text_embedding_exists, text_embedding_exists),
+        image_vector = COALESCE(:image_vector, image_vector),
+        text_vector = COALESCE(:text_vector, text_vector),
         last_modified = :last_modified;
     """
     cursor.execute(query, full_data)
@@ -146,7 +156,6 @@ def load_models_from_csv(csv_path: str, db_path: str) -> None:
     try:
         with conn:
             cursor = conn.cursor()
-            # Otwarcie pliku z uwzględnieniem kodowania UTF-8 i Windows newline
             with open(csv_file, mode="r", encoding="utf-8", newline="") as f:
                 reader = csv.DictReader(f)
 
@@ -154,22 +163,19 @@ def load_models_from_csv(csv_path: str, db_path: str) -> None:
                     logger.warning(f"Plik CSV {csv_path} jest pusty lub uszkodzony.")
                     return
 
-                # Mapowanie nazw kolumn z CSV na klucze bazy danych
                 for row in reader:
-                    # Bezpieczna konwersja ID na int, jeśli istnieje
-                    raw_id = row.get("ID")
-                    model_id = int(raw_id) if raw_id and raw_id.isdigit() else None
-
+                    # 4. ZGODNOŚĆ KLUCZY: Zamieniłem wielkie litery na czysty standard snake_case
                     model_data = {
-                        "id": model_id,
                         "name": row.get("Nazwa"),
-                        "manufacturer": row.get("Producent"),
-                        "category": row.get("Kategoria"),
                         "dwx_path": row.get("DWG"),
                         "jpg_path": row.get("JPG"),
+                        "manufacturer": row.get("Producent"),
+                        "opis_produktu": row.get("Opis_Produktu"),
+                        "grupa": row.get("Grupa"),
+                        "typ": row.get("Typ"),
+                        "typ_standardowy": row.get("typ_standardowy"),
                     }
 
-                    # Oczyszczenie stringów z białych znaków (stripping)
                     cleaned_data = {
                         k: (v.strip() if isinstance(v, str) else v)
                         for k, v in model_data.items()
@@ -188,7 +194,7 @@ def load_models_from_csv(csv_path: str, db_path: str) -> None:
 def get_models_missing_files(db_path: str) -> List[Dict[str, Any]]:
     """
     Weryfikuje fizyczną obecność plików na dysku (JPG i DWX).
-    Automatycznie odcina zdublowane końcówki plików (np. '88378 88378' lub '88378\\n88378').
+    Automatycznie odcina zdublowane końcówki plików (np. '88378 88378').
     """
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
@@ -199,31 +205,24 @@ def get_models_missing_files(db_path: str) -> List[Dict[str, Any]]:
         cursor.execute("SELECT id, name, jpg_path, dwx_path FROM models")
         rows = cursor.fetchall()
 
-        # Wewnętrzna funkcja naprawiająca błędy Windowsa oraz dublowanie nazw
         def sanitize_and_fix_path(raw_path: Optional[str], default_ext: str) -> Optional[Path]:
             if not raw_path:
                 return None
             
-            # 1. Wstępne oczyszczenie z białych znaków na skrajach
             p_str = raw_path.strip()
             
-            # 2. Naprawa struktury dysku C:
             if p_str.upper().startswith("C:"):
                 remainder = p_str[2:].lstrip(" \\")
                 p_str = "C:\\" + remainder
 
-            # 3. FIX NA ZDUBLOWANĄ KOŃCÓWKĘ (np. "88378 88378" lub "88378\n88378")
             if "\\" in p_str:
                 directory, filename_part = p_str.rsplit("\\", 1)
-                # Rozbijamy końcówkę po jakichkolwiek białych znakach (spacja, nowa linia)
                 tokens = filename_part.strip().split()
                 
-                # Jeśli wykryjemy dokładnie dwa takie same tokeny obok siebie
                 if len(tokens) == 2 and tokens[0] == tokens[1]:
-                    filename_part = tokens[0]  # Zostawiamy tylko jeden czysty numer
+                    filename_part = tokens[0]
                     p_str = directory + "\\" + filename_part
 
-            # 4. Budujemy właściwy obiekt Path i dodajemy rozszerzenie, jeśli go brak
             p = Path(p_str)
             if not p.suffix:
                 p = p.with_suffix(default_ext)
@@ -234,7 +233,6 @@ def get_models_missing_files(db_path: str) -> List[Dict[str, Any]]:
             missing_jpg = False
             missing_dwx = False
 
-            # Walidacja JPG
             clean_jpg = sanitize_and_fix_path(model["jpg_path"], ".jpg")
             if clean_jpg:
                 if not clean_jpg.exists():
@@ -242,7 +240,6 @@ def get_models_missing_files(db_path: str) -> List[Dict[str, Any]]:
             else:
                 missing_jpg = True
 
-            # Walidacja DWX/DWG
             clean_dwx = sanitize_and_fix_path(model["dwx_path"], ".dwx")
             if clean_dwx:
                 path_as_is = clean_dwx
@@ -271,10 +268,8 @@ def get_models_missing_files(db_path: str) -> List[Dict[str, Any]]:
 
 def sync_database_with_filesystem(db_path: str) -> None:
     """
-    Skanuje bazę danych pod kątem brakujących plików.
-    Jeśli plik nie istnieje w zdefiniowanej ścieżce, sprawdza katalog nadrzędny (parent).
-    Jeśli plik tam jest -> aktualizuje ścieżkę w bazie danych SQLite.
-    Jeśli nadal go nie ma -> wypisuje ostrzeżenie o braku.
+    Skanuje bazę danych pod kątem brakujących plików i automatycznie naprawia ścieżki
+    w katalogu nadrzędnym (parent directory), jeśli pliki tam istnieją.
     """
     missing_files = get_models_missing_files(db_path)
 
@@ -285,40 +280,28 @@ def sync_database_with_filesystem(db_path: str) -> None:
     conn = sqlite3.connect(db_path)
     try:
         cursor = conn.cursor()
-        
-        # Otwieramy jedną transakcję dla wszystkich ewentualnych aktualizacji ścieżek
         with conn:
             for item in missing_files:
                 model_id = item["id"]
                 model_name = item["name"]
 
-                # -------------------------------------------------------------
-                # REKURENCJA DLA JPG: Szukanie w katalogu nadrzędnym
-                # -------------------------------------------------------------
                 if item["missing_jpg"] and item["clean_jpg_obj"]:
                     orig_path: Path = item["clean_jpg_obj"]
-                    # orig_path.parent to obecny folder, .parent.parent to katalog wyżej
                     parent_dir = orig_path.parent.parent 
                     fallback_jpg_path = parent_dir / orig_path.name
 
                     if parent_dir.exists() and fallback_jpg_path.exists():
-                        # Sukces! Znaleziono plik wyżej. Aktualizujemy bazę.
                         new_path_str = str(fallback_jpg_path.resolve())
                         cursor.execute("UPDATE models SET jpg_path = ? WHERE id = ?", (new_path_str, model_id))
-                        # logger.info(f"🔄 [Auto-Fix JPG] Model ID {model_id} ({model_name}): Przeniesiono ścieżkę poziom wyżej -> {new_path_str}")
-                        item["missing_jpg"] = False  # Flaga wyczyszczona
+                        item["missing_jpg"] = False
                     else:
                         logger.warning(f"❌ [Brak pliku JPG] Model ID {model_id} ({model_name}): Nie znaleziono w {item['jpg_path']}")
 
-                # -------------------------------------------------------------
-                # REKURENCJA DLA DWX/DWG: Szukanie w katalogu nadrzędnym + fallback rozszerzeń
-                # -------------------------------------------------------------
                 if item["missing_dwx"] and item["clean_dwx_obj"]:
                     orig_path: Path = item["clean_dwx_obj"]
                     parent_dir = orig_path.parent.parent
 
                     if parent_dir.exists():
-                        # Przygotowujemy potencjalne warianty pliku w katalogu nadrzędnym
                         fallback_as_is = parent_dir / orig_path.name
                         fallback_as_dwx = parent_dir / orig_path.with_suffix(".dwx").name
                         fallback_as_dwg = parent_dir / orig_path.with_suffix(".dwg").name
@@ -332,11 +315,10 @@ def sync_database_with_filesystem(db_path: str) -> None:
                             found_dwx_path = fallback_as_dwg
 
                         if found_dwx_path:
-                            # Sukces! Znaleziono plik modelowy CAD wyżej.
                             new_path_str = str(found_dwx_path.resolve())
                             cursor.execute("UPDATE models SET dwx_path = ? WHERE id = ?", (new_path_str, model_id))
                             logger.info(f"🔄 [Auto-Fix DWX] Model ID {model_id} ({model_name}): Przeniesiono ścieżkę poziom wyżej -> {new_path_str}")
-                            item["missing_dwx"] = False  # Flaga wyczyszczona
+                            item["missing_dwx"] = False
                         else:
                             logger.warning(f"❌ [Brak pliku CAD] Model ID {model_id} ({model_name}): Nie znaleziono w {item['dwx_path']}")
                     else:
@@ -347,67 +329,3 @@ def sync_database_with_filesystem(db_path: str) -> None:
         raise
     finally:
         conn.close()
-
-
-# =====================================================================
-# 🚀 PRZYKŁAD UŻYCIA (RUNNABLE)
-# =====================================================================
-if __name__ == "__main__":
-    DB_NAME = "models.db"
-    CSV_NAME = "test_models.csv"
-
-    print("--- 1. Inicjalizacja bazy danych ---")
-    create_database(DB_NAME)
-
-    print("\n--- 2. Tworzenie syntetycznego pliku CSV do testów ---")
-    # Generujemy tymczasowe pliki atrapy na dysku, by testy przeszły pomyślnie
-    Path("assets/images").mkdir(parents=True, exist_ok=True)
-    Path("assets/cad").mkdir(parents=True, exist_ok=True)
-    
-    dummy_jpg = Path("assets/images/sofa_modern.jpg")
-    dummy_dwg = Path("assets/cad/sofa_modern.dwg")
-    dummy_jpg.touch(exist_ok=True)
-    dummy_dwg.touch(exist_ok=True)
-
-    with open(CSV_NAME, mode="w", encoding="utf-8", newline="") as f:
-        writer = csv.writer(f)
-        # Nagłówki zgodne ze specyfikacją (w tym jedna losowa kolumna do testu odporności)
-        writer.writerow(["ID", "Nazwa", "Producent", "Kategoria", "DWG", "JPG", "NieznanaKolumna"])
-        writer.writerow(["1", "Sofa Modern", "Kler", "Meble Tapicerowane", str(dummy_dwg), str(dummy_jpg), "ignoruj"])
-        writer.writerow(["2", "Krzesło Loft", "IKEA", "Krzesła", "assets/cad/broken_path.dwg", "", "test"])
-
-    print("\n--- 3. Masowe ładowanie danych z pliku CSV ---")
-    load_models_from_csv(CSV_NAME, DB_NAME)
-
-    print("\n--- 4. Pojedynczy Insert lub Update (Test mechanizmu Upsert) ---")
-    # Aktualizujemy rekord dla 'Sofa Modern' podając wymiary oraz informację o embeddingu
-    update_payload = {
-        "name": "Sofa Modern - Premium Edition",
-        "dwx_path": str(dummy_dwg),  # Ten sam dwx_path wymusi aktualizację zamiast nowego ID
-        "manufacturer": "Kler",
-        "category": "Meble Wysegmentowane",
-        "width_mm": 2200,
-        "depth_mm": 950,
-        "height_mm": 850,
-        "image_embedding_exists": 1,
-    }
-    insert_or_update_model(DB_NAME, update_payload)
-
-    print("\n--- 5. Pobieranie modeli bez embeddingów tekstowych/obrazowych ---")
-    missing_embeddings = get_models_missing_embeddings(DB_NAME)
-    print(f"Liczba modeli wymagających przetworzenia przez CLIP/SigLIP: {len(missing_embeddings)}")
-    for item in missing_embeddings:
-        print(f" - ID: {item['id']}, Nazwa: {item['name']}, Ścieżka CAD: {item['dwx_path']}")
-
-    print("\n--- 6. Synchronizacja i weryfikacja plików na dysku ---")
-    sync_database_with_filesystem(DB_NAME)
-
-    print("\n--- 7. Sprzątanie plików testowych ---")
-    # Usuwanie plików tymczasowych utworzonych na potrzeby prezentacji kodu
-    if Path(DB_NAME).exists():
-        os.remove(DB_NAME)
-    if Path(CSV_NAME).exists():
-        os.remove(CSV_NAME)
-    dummy_jpg.unlink(missing_ok=True)
-    dummy_dwg.unlink(missing_ok=True)
-    print("Testy zakończone sukcesem. Wszystkie mechanizmy działają prawidłowo.")

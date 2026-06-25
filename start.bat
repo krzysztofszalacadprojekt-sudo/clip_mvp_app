@@ -18,7 +18,7 @@ echo ==============================
 echo Starting C++ application...
 echo ==============================
 
-cd /d "%~dp0CPP_apka\build\Release"
+cd /d "%~dp0search_client\build\Release"
 start "" TestBackend.exe
 
 echo All started.

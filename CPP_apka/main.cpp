@@ -11,6 +11,8 @@
 #include <windows.h> // Potrzebne do MultiByteToWideChar
 #include <algorithm>
 #include <cctype>
+#include <thread>
+#include <sqlite3.h>
 
 namespace fs = std::filesystem;
 std::ofstream logFile;
@@ -18,46 +20,125 @@ std::ofstream logFile;
 void menu() {
     std::cout << "\n==== Menu ====\n";
     std::cout << "1. Update embeddings\n";
-    std::cout << "2. Search by text\n";
+    std::cout << "2. Search by text (Hybrid Multimodal)\n"; // 🚀 Zaktualizowany opis opcji
     std::cout << "3. Search by image\n";
+    std::cout << "4. Add new model\n";
+    std::cout << "5. Delete model manually\n";
     std::cout << "0. Exit\n";
     std::cout << "Choose an option: ";
 }
 
+size_t WriteCallback(void* contents, size_t size, size_t nmemb, std::string* s);
+
+void TriggerBackendSync(const std::string& base_url)
+{
+    std::thread([base_url]() {
+        CURL* curl = curl_easy_init();
+        if (curl) {
+            std::string url = base_url + "/sync";
+            std::string response;
+
+            curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+            curl_easy_setopt(curl, CURLOPT_POST, 1L);
+            curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, 0L); 
+            curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
+            curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+            curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5L);
+
+            CURLcode res = curl_easy_perform(curl);
+            if (res == CURLE_OK) {
+                std::cout << "\n📦 [Background Sync] FAISS rebuild triggered successfully.\n";
+            }
+            curl_easy_cleanup(curl);
+        }
+    }).detach();
+}
+
+bool DeleteModelFromDB(sqlite3* db, const std::string& dwx_path, const std::string& base_url)
+{
+    const char* sql = "DELETE FROM models WHERE dwx_path = ?;";
+    sqlite3_stmt* stmt;
+
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        std::cerr << "❌ SQL Error (prepare): " << sqlite3_errmsg(db) << "\n";
+        return false;
+    }
+
+    sqlite3_bind_text(stmt, 1, dwx_path.c_str(), -1, SQLITE_TRANSIENT);
+
+    bool success = false;
+    
+    if (sqlite3_step(stmt) == SQLITE_DONE) {
+        int rowsAffected = sqlite3_changes(db);
+        if (rowsAffected > 0) {
+            std::cout << "💥 Model removed from SQLite successfully.\n";
+            TriggerBackendSync(base_url);
+            success = true;
+        } else {
+            std::cout << "⚠️ No model found with given path: " << dwx_path << "\n";
+        }
+    } else {
+        std::cerr << "❌ SQL Error (execute): " << sqlite3_errmsg(db) << "\n";
+    }
+
+    sqlite3_finalize(stmt);
+    return success;
+}
+
+bool AddNewModelToDB(sqlite3* db, 
+                     const std::string& name, 
+                     const std::string& manufacturer, 
+                     const std::string& dwx_path, 
+                     const std::string& jpg_path,
+                     const std::string& base_url)
+{
+    const char* sql = "INSERT OR REPLACE INTO models (name, manufacturer, dwx_path, jpg_path, image_embedding_exists, text_embedding_exists, grupa, typ, typ_standardowy, opis_produktu) "
+                      "VALUES (?, ?, ?, ?, 0, 0, '', '', '', '');";
+    sqlite3_stmt* stmt;
+
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        std::cerr << "❌ SQL Error (prepare): " << sqlite3_errmsg(db) << "\n";
+        return false;
+    }
+
+    sqlite3_bind_text(stmt, 1, name.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, manufacturer.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, dwx_path.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 4, jpg_path.c_str(), -1, SQLITE_TRANSIENT);
+
+    bool success = false;
+
+    if (sqlite3_step(stmt) == SQLITE_DONE) {
+        std::cout << "✨ New model injected into SQLite.\n";
+        TriggerBackendSync(base_url);
+        success = true;
+    } else {
+        std::cerr << "❌ SQL Error (execute): " << sqlite3_errmsg(db) << "\n";
+    }
+
+    sqlite3_finalize(stmt);
+    return success;
+}
+
 std::string safe_json_string(const std::string& input) {
-    printf("Debug: Original input string: '%s'\n", input.c_str());
     std::string result;
     for (unsigned char c : input) {
-        // 1. Wycinamy niebezpieczne znaki kontrolne ASCII (0-31) oraz bajt zerowy
-        if (c < 32) continue; 
-        
-        // 2. Eskapujemy cudzysłów (bo on może rozbić strukturę JSON)
-        if (c == '"') {
-            result += "\\\""; 
-        } 
-        // 3. 🚀 KOMPROMIS: Zamiast eskapować backslash, zamieniamy go na bezpieczną spację
-        else if (c == '\\') {
-            result += " "; // Bezpieczna separacja słów
-        } 
-        else {
-            result += c;
-        }
+        if (c < 32) { result += " "; } 
+        else if (c == '"') { result += "\\\""; } 
+        else if (c == '\\') { result += " "; } 
+        else { result += c; }
     }
     return result;
 }
 
 std::string console_to_utf8(const std::string& input) {
     if (input.empty()) return "";
-    
-    // 1. Pobieramy aktualną stronę kodową wejścia terminala klienta (np. 852)
     UINT current_cp = GetConsoleCP();
     
-    // Krok A: Konwersja lokalnego kodowania konsoli -> UTF-16 (wstring)
     int wlen = MultiByteToWideChar(current_cp, 0, input.c_str(), (int)input.length(), NULL, 0);
     std::wstring wstr(wlen, 0);
     MultiByteToWideChar(current_cp, 0, input.c_str(), (int)input.length(), &wstr[0], wlen);
     
-    // Krok B: Konwersja UTF-16 (wstring) -> Czysty, uniwersalny UTF-8 (string)
     int u8len = WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), (int)wstr.length(), NULL, 0, NULL, NULL);
     std::string u8str(u8len, 0);
     WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), (int)wstr.length(), &u8str[0], u8len, NULL, NULL);
@@ -65,7 +146,6 @@ std::string console_to_utf8(const std::string& input) {
     return u8str;
 }
 
-// Pomocnicza funkcja konwertująca UTF-8 string na Windowsowy wstring
 std::wstring utf8_to_wstring(const std::string& str) {
     if (str.empty()) return L"";
     int size_needed = MultiByteToWideChar(CP_UTF8, 0, &str[0], (int)str.size(), NULL, 0);
@@ -77,7 +157,6 @@ std::wstring utf8_to_wstring(const std::string& str) {
 void process_and_display_results(const std::string& raw_json_response) {
     std::cout << "\nProcessing search results using native C++ filesystem...\n";
     
-    // Czyszczenie i tworzenie folderu w bezpieczny sposób przez bibliotekę C++
     fs::path target_dir("search_results");
     fs::remove_all(target_dir);
     fs::create_directories(target_dir);
@@ -95,7 +174,6 @@ void process_and_display_results(const std::string& raw_json_response) {
         if (start_quote != std::string::npos && end_quote != std::string::npos) {
             std::string source_path = raw_json_response.substr(start_quote + 1, end_quote - start_quote - 1);
             
-            // Naprawa podwójnych backslashy (\\ -> \) z JSON-a
             std::string clean_path = "";
             for (size_t i = 0; i < source_path.length(); ++i) {
                 if (source_path[i] == '\\' && i + 1 < source_path.length() && source_path[i+1] == '\\') {
@@ -107,7 +185,6 @@ void process_and_display_results(const std::string& raw_json_response) {
             }
             if (clean_path.empty()) clean_path = source_path;
 
-            // Konwersja na bezpieczne ścieżki Windows (Wide-char) z pełną obsługą polskich liter
             std::wstring w_clean_path = utf8_to_wstring(clean_path);
             fs::path src_file(w_clean_path);
 
@@ -169,13 +246,8 @@ size_t WriteCallback(void* contents, size_t size, size_t nmemb, std::string* s)
 {
     size_t totalSize = size * nmemb;
     std::string data((char*)contents, totalSize);
-
     s->append(data);
-
-    if (logFile.is_open()) {
-        logFile << data << std::endl;
-    }
-
+    if (logFile.is_open()) { logFile << data << std::endl; }
     return totalSize;
 }
 
@@ -183,23 +255,12 @@ std::string escape_json_string(const std::string& input)
 {
     std::string output;
     output.reserve(input.size());
-
     for (char c : input)
     {
-        if (c == '\\')
-        {
-            output += "\\\\";
-        }
-        else if (c == '"')
-        {
-            output += "\\\"";
-        }
-        else
-        {
-            output += c;
-        }
+        if (c == '\\') { output += "\\\\"; }
+        else if (c == '"') { output += "\\\""; }
+        else { output += c; }
     }
-
     return output;
 }
 
@@ -207,32 +268,23 @@ std::string build_directories_json(const std::string& dirs)
 {
     std::stringstream ss(dirs);
     std::string dir;
-
     std::string json = "{\"directories\":[";
-
     bool first = true;
 
     while (std::getline(ss, dir, ';'))
     {
-        if (!first)
-            json += ",";
-
+        if (!first) json += ",";
         json += "\"" + escape_json_string(dir) + "\"";
-
         first = false;
     }
 
     json += "]}";
-
     return json;
 }
 
 std::string send_json_post(CURL* curl, const std::string& url, const std::string& json_payload) {
-
     if (logFile.is_open()) {
-        logFile << "\n==== REQUEST ====\n";
-        logFile << url << "\n";
-        logFile << json_payload << "\n";
+        logFile << "\n==== REQUEST ====\n" << url << "\n" << json_payload << "\n";
     }
 
     curl_easy_reset(curl); 
@@ -245,17 +297,15 @@ std::string send_json_post(CURL* curl, const std::string& url, const std::string
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_payload.c_str());
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 300L);
 
     CURLcode res = curl_easy_perform(curl);
     if (res != CURLE_OK) {
         std::cout << "Request failed (" << url << "): " << curl_easy_strerror(res) << "\n";
     } else {
-        std::cout << "Response from " << url << ":\n" << response << "\n";
+        std::cout << "Response received from server.\n";
         if (logFile.is_open()) {
-            logFile << "\n==== RESPONSE ====\n";
-            logFile << response << "\n";
+            logFile << "\n==== RESPONSE ====\n" << response << "\n";
         }
     }
     curl_slist_free_all(headers);
@@ -265,28 +315,18 @@ std::string send_json_post(CURL* curl, const std::string& url, const std::string
 std::string send_empty_post(CURL* curl, const std::string& url) {
     curl_easy_reset(curl);
     std::string response;
-
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
     curl_easy_setopt(curl, CURLOPT_POST, 1L);
     curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, 0L); 
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-
     CURLcode res = curl_easy_perform(curl);
-    if (res != CURLE_OK) {
-        std::wcout << L"Request failed (" << utf8_to_wstring(url) << L"): " << utf8_to_wstring(curl_easy_strerror(res)) << L"\n";
-    } else {
-        std::wcout << L"Response from " << utf8_to_wstring(url) << L":\n" << utf8_to_wstring(response) << L"\n";
-    }
     return response;
 }
 
 std::string send_multipart_post(CURL* curl, const std::string& url, const std::string& file_path, const std::string& top_k) {
     if (logFile.is_open()) {
-        logFile << "\n==== REQUEST (MULTIPART) ====\n";
-        logFile << url << "\n";
-        logFile << "file: " << file_path << "\n";
-        logFile << "top_k: " << top_k << "\n";
+        logFile << "\n==== REQUEST (MULTIPART) ====\n" << url << "\nfile: " << file_path << "\ntop_k: " << top_k << "\n";
     }
 
     curl_easy_reset(curl);
@@ -318,18 +358,13 @@ std::string send_multipart_post(CURL* curl, const std::string& url, const std::s
     if (res != CURLE_OK) {
         std::wcout << L"Request failed (" << utf8_to_wstring(url) << L"): " << utf8_to_wstring(curl_easy_strerror(res)) << L"\n";
     } else {
-        std::wcout << L"Response from " << utf8_to_wstring(url) << L":\n" << utf8_to_wstring(response) << L"\n";
-        if (logFile.is_open()) {
-            logFile << "\n==== RESPONSE ====\n";
-            logFile << response << "\n";
-        }
+        if (logFile.is_open()) { logFile << "\n==== RESPONSE ====\n" << response << "\n"; }
     }
     curl_mime_free(form);
     return response;
 }
 
 int main() {
-
     curl_global_init(CURL_GLOBAL_DEFAULT);
     CURL* curl = curl_easy_init();
 
@@ -350,7 +385,10 @@ int main() {
 top_k=5
 directories=C:/Users/CAD/Desktop/clip_fast_api/images;
 target_image=C:/Users/CAD/Desktop/clip_fast_api/images/sofa.jpg
-)"; // <--- TUTAJ: Dodaliśmy domyślną ścieżkę do testowego zdjęcia
+New_model_name=Blat 1
+New_dwx_path=dodatki\akcesoria_kuchenne\blat_i
+New_jpg_path=dodatki\akcesoria_kuchenne\blat_i.jpg
+)";
             create_config.close();
         }
     } else {
@@ -360,7 +398,7 @@ target_image=C:/Users/CAD/Desktop/clip_fast_api/images/sofa.jpg
     int choice = -1;
 
     while (choice != 0) {
-        menu(); // Upewnij się, że w funkcji menu() zmieniłeś opisy na 1, 2, 3, 0
+        menu();
         if (!(std::cin >> choice)) {
             std::cin.clear();
             std::cin.ignore(10000, '\n');
@@ -373,13 +411,13 @@ target_image=C:/Users/CAD/Desktop/clip_fast_api/images/sofa.jpg
             break;
         }
 
-        // Pobieranie infrastruktury z pliku konfiguracyjnego na bieżąco
         auto config = load_config(config_filename);
         std::string base_url = config["base_url"];
         std::string top_k = config["top_k"];
         std::string directories = config["directories"];
+        fs::path db_path = "../../../clip_fast_api/data/models.db";
+        fs::path absolute_db_path = fs::absolute(db_path);
 
-        // Czyszczenie bufora strumienia wejściowego przed użyciem std::getline
         std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
 
         switch (choice) {
@@ -392,71 +430,111 @@ target_image=C:/Users/CAD/Desktop/clip_fast_api/images/sofa.jpg
             }
 
             case 2: {
+                // 🚀 ROZBUDOWANA DIAGNOSTYKA I INTERFEJS CMD DLA ALFY (Wyszukiwanie Hybrydowe)
                 std::string local_input;
                 std::cout << "Enter text search query (e.g., modern oak chair): ";
-                
-                // 1. Pobieramy surowy ciąg znaków z konsoli
                 std::getline(std::cin, local_input);
                 
-                // 🛑 DEFENSYWNA BLOKADA: Sprawdzamy czy użytkownik wpisał cokolwiek poza spacjami
                 if (local_input.empty() || std::all_of(local_input.begin(), local_input.end(), [](unsigned char c) { return std::isspace(c); })) {
                     std::cout << "⚠️ Search query cannot be empty!\n";
                     break;
                 }
+
+                // Pobieranie wartości alfa live z terminala CMD
+                std::cout << "Enter Alpha balance for Score Fusion [0.0 = 100% Text, 1.0 = 100% Image] (default: 0.35): ";
+                std::string alpha_input;
+                std::getline(std::cin, alpha_input);
                 
-                // 2. Tłumaczymy znaki terminala na standard internetowy UTF-8
+                double alpha = 0.35; // Sugerowany punkt startowy
+                if (!alpha_input.empty()) {
+                    try {
+                        double parsed = std::stod(alpha_input);
+                        if (parsed >= 0.0 && parsed <= 1.0) {
+                            alpha = parsed;
+                        } else {
+                            std::cout << "⚠️ Alpha out of range [0.0 - 1.0]. Using default 0.35\n";
+                        }
+                    } catch (...) {
+                        std::cout << "⚠️ Invalid input type. Using default 0.35\n";
+                    }
+                }
+
                 std::string search_query = console_to_utf8(local_input);
-                
-                // 3. 🚀 KLUCZOWE: Sanityzacja i eskapowanie pod JSON (odcinamy " i \ oraz błędy bajtów)
                 std::string escaped_query = safe_json_string(search_query);
                 
-                // Diagnostyka lokalna (używa oryginalnego stringa do ładnego wyświetlenia)
-                std::wcout << L"Searching databases for: '" << utf8_to_wstring(search_query) << L"'...\n";
+                std::wcout << L"Executing Hybrid Lookup for: '" << utf8_to_wstring(search_query) << L"' with Alpha = " << alpha << L"...\n";
                 
-                // 4. Bezpieczne i stabilne złożenie payloadu JSON
-                // Używamy std::to_string(top_k), aby jawnie i bezpiecznie przekonwertować int na tekst
-                std::string json_payload = "{\"text\": \"" + escaped_query + "\", \"top_k\": " + top_k + "}";
+                // Budowa payloadu JSON uwzględniającego parametr alpha
+                std::string json_payload = "{\"text\": \"" + escaped_query + "\", \"top_k\": " + top_k + ", \"alpha\": " + std::to_string(alpha) + "}";
                 
-                // 5. Wysyłka do FastAPI
-                std::string response = send_json_post(curl, base_url + "/find-similar-images-by-text", json_payload);
-
+                // Wysyłamy żądanie do nowego, zunifikowanego endpointu hybrydowego
+                std::string response = send_json_post(curl, base_url + "/find-similar-images-by-hybrid-search", json_payload);
                 process_and_display_results(response);
                 break;
             }
 
             case 3: {
-                //  Pobieramy ścieżkę bezpośrednio z pliku konfiguracyjnego
                 std::string image_input = config["target_image"];
-                
                 if (image_input.empty()) {
                     std::cout << "Error: 'target_image' is not defined in config.txt!\n";
                     break;
                 }
                 
                 std::cout << "Executing visual lookup for asset from config: '" << image_input << "'...\n";
-                
-                // Wysyłamy zapytanie do serwera FastAPI
                 std::string response = send_multipart_post(curl, base_url + "/find-similar-images-by-image", image_input, top_k);
-
-                // Kopiujemy i otwieramy folder z wynikami
                 process_and_display_results(response);
                 break;
             }
 
-            // case 4: {
-            //     std::string search_query = config["text"];
-                
-            //     std::cout << "Searching databases for: '" << search_query << "'...\n";
-            //     std::string response = send_json_post(curl, base_url + "/find-similar-images-by-text", "{\"text\": \"" + search_query + "\", \"top_k\": " + top_k + "}");
+            case 4: {
+                std::string name, dwx_path, jpg_path, manufacturer = "Unknown";
+                std::cout << "\n--- Add New Model ---\n";
 
-            //     process_and_display_results(response);
-            //     break;
-            // }
+                name = config["New_model_name"];
+                dwx_path = config["New_dwx_path"];
+                jpg_path = config["New_jpg_path"];
+
+                if (dwx_path.empty() || name.empty()) {
+                    std::cout << "⚠️ Error: Name and DWX Path cannot be empty!\n";
+                    break;
+                }
+
+                sqlite3* db = nullptr;
+                if (sqlite3_open(absolute_db_path.string().c_str(), &db) == SQLITE_OK) {
+                    AddNewModelToDB(db, name, manufacturer, dwx_path, jpg_path, base_url);
+                    sqlite3_close(db);
+                    std::cout << "🚀 Add operation complete. Database connection released.\n";
+                } else {
+                    std::cerr << "❌ Cannot open database: " << sqlite3_errmsg(db) << "\n";
+                }
+                break;
+            }
+
+            case 5: {
+                std::string dwx_path_to_delete;
+                std::cout << "\n--- Delete Model Manually ---\n";
+                std::cout << "Enter the exact (.dwx) path of the model to remove: ";
+                std::getline(std::cin, dwx_path_to_delete);
+
+                if (dwx_path_to_delete.empty()) {
+                    std::cout << "⚠️ Error: Path cannot be empty!\n";
+                    break;
+                }
+
+                sqlite3* db = nullptr;
+                if (sqlite3_open(absolute_db_path.string().c_str(), &db) == SQLITE_OK) {
+                    DeleteModelFromDB(db, dwx_path_to_delete, base_url);
+                    sqlite3_close(db);
+                    std::cout << "🚀 Delete operation complete. Database connection released.\n";
+                } else {
+                    std::cerr << "❌ Cannot open database: " << sqlite3_errmsg(db) << "\n";
+                }
+                break;
+            }
 
             default:
                 std::cout << "Invalid choice. Try again.\n";
         }
-        
         std::cout << "\n----------------------------------------\n";
     }
 
