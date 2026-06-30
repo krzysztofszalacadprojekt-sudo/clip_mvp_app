@@ -13,10 +13,8 @@ from .image_preprocessor import preprocess_image
 from .clip_model import get_text_embedding as get_clip_text_embedding, get_image_embedding
 from app import config
 from .embedding_store import (
-    create_and_save_embeddings,
     load_index_and_paths,
     search_similar_images,
-    update_embeddings,
     update_embeddings_from_db,
 )
 from .config import MODELS_DIR, EMBEDDINGS_DIR, DB_PATH
@@ -65,8 +63,7 @@ async def lifespan(app: FastAPI):
 
         app.state.tokenizer = AutoTokenizer.from_pretrained(
             str(config.TOKENIZER_DIR),
-            local_files_only=True,
-            fix_mistral_regex=False
+            local_files_only=True
         )
 
         print(f"✅ Tokenizer loaded in {time.time() - start:.2f}s")
@@ -159,20 +156,6 @@ def get_embedding_endpoint(prompt: TextPrompt, request: Request):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/create-embeddings")
-def create_embeddings_endpoint():
-    start_time = time.time()
-    try:
-        create_and_save_embeddings()
-        global index, image_paths
-        index, image_paths = load_index_and_paths()
-        
-        elapsed = time.time() - start_time
-        print(f"⏱️ Create embeddings completed in {elapsed:.2f} seconds.")
-        return JSONResponse(content={"message": f"Embeddings created and saved successfully in {elapsed:.2f}s."})
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
 @app.post("/update-embeddings")
 def update_embeddings_endpoint():
     print("📥 Odebrano żądanie aktualizacji embeddingów z bazy danych SQLite.")
@@ -238,33 +221,50 @@ def find_similar_images_by_text(prompt: TextPrompt, request: Request):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/find-similar-images-by-image")
-async def find_similar_images_by_image(file: UploadFile = File(...), top_k: int = 5):
+def find_similar_images_by_image(file: UploadFile = File(...), top_k: int = 10):
+    """
+    Endpoint wyszukiwania graficznego (Image-to-Image).
+    Uruchamiany synchronicznie w Thread Poolu, dzięki czemu ciężka inferencja ONNX
+    nie blokuje innych żądań płynących do serwera.
+    """
     global index, image_paths
     print(f"Received image search request (top_k={top_k})")
     start_time = time.time()
+    
     if index is None:
         raise HTTPException(status_code=400, detail="Index not loaded.")
 
+    # Upewniamy się, że katalog tymczasowy istnieje na dysku
+    temp_dir = Path("temp")
+    temp_dir.mkdir(exist_ok=True)
+    temp_path = temp_dir / file.filename
+
     try:
-        temp_path = None
-        try:
-            temp_path = Path("temp") / file.filename
-            with open(temp_path, "wb") as buffer:
-                buffer.write(await file.read())
+        file_bytes = file.file.read()
+        
+        with open(temp_path, "wb") as buffer:
+            buffer.write(file_bytes)
 
-            pixel_values = preprocess_image(str(temp_path))
-            image_embedding = get_image_embedding(pixel_values)
-            
-            results = search_similar_images(image_embedding, index, image_paths, top_k)
-        finally:
-            if temp_path and temp_path.exists():
-                temp_path.unlink()
-
+        pixel_values = preprocess_image(str(temp_path))
+        image_embedding = get_image_embedding(pixel_values)
+        
+        results = search_similar_images(image_embedding, index, image_paths, top_k)
+        
         elapsed = time.time() - start_time
         print(f"⏱️ Image search completed in {elapsed:.3f} seconds.")
         return JSONResponse(content=results)
+        
     except Exception as e:
+        print(f"❌ Image search failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+        
+    finally:
+        # Pancerne czyszczenie dysku SSD z plików tymczasowych
+        if temp_path and temp_path.exists():
+            try:
+                temp_path.unlink()
+            except Exception as unlink_err:
+                print(f"⚠️ Nie udalo sie usunac pliku tymczasowego: {unlink_err}")
     
 @app.get("/")
 def root():

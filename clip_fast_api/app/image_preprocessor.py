@@ -15,10 +15,10 @@ def _init_processor():
             raise FileNotFoundError(f"Processor directory not found at: {MODELS_DIR}")
             
         # AutoProcessor dynamically reads the unique preprocessor_config.json
+        # ✅ POPRAWIONY, CZYSTY KOD:
         processor = AutoProcessor.from_pretrained(
             str(TOKENIZER_DIR), 
-            local_files_only=True,
-            fix_mistral_regex=False
+            local_files_only=True
         )
         print("Processor initialized.")
 
@@ -28,16 +28,6 @@ def preprocess_image(image_path: str):
     """
     _init_processor()
     image = Image.open(image_path).convert("RGB")
-    
-    # Check: what size is the raw image?
-    print(f"[preprocess_image] Raw image size: {image.size}")
-    
-    # Processor should resize to 256x256 per config
     inputs = processor(images=image, return_tensors="np")
     pixel_values = inputs["pixel_values"]
-    
-    # Check: what size came out?
-    print(f"[preprocess_image] Preprocessed pixel_values shape: {pixel_values.shape}")
-    # Should be (1, 3, 256, 256) or (1, 768, 256, 256) depending on order
-    
     return pixel_values

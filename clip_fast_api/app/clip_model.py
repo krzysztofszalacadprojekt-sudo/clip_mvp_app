@@ -45,22 +45,25 @@ def _get_active_session(session_type: str):
 def _run_vision_inference(pixel_data):
     session = _get_active_session("visual")
     onnx_inputs = {}
-    
-    # Mapowanie wejść: Uniwersalna pętla obsługująca nazwy węzłów dla CLIP i SigLIP
+
+    batch_size = pixel_data.shape[0]
+    default_sequence_length = 64
+
     for inp in session.get_inputs():
         if "pixel" in inp.name.lower():
             onnx_inputs[inp.name] = pixel_data
         elif config.IS_UNIFIED:
-            # Maskowanie sygnatury tekstu atrapami danych (wymóg zunifikowanego grafu)
             if 'int32' in inp.type:
-                onnx_inputs[inp.name] = np.zeros((1, 1), dtype=np.int32)
+                onnx_inputs[inp.name] = np.zeros((batch_size, default_sequence_length), dtype=np.int32)
             elif 'int64' in inp.type:
-                onnx_inputs[inp.name] = np.zeros((1, 1), dtype=np.int64)
+                onnx_inputs[inp.name] = np.zeros((batch_size, default_sequence_length), dtype=np.int64)
 
-    output_names = [out.name for out in session.get_outputs()]
-    target_output = "image_embeds" if "image_embeds" in output_names else output_names[0]
+    outputs_meta = session.get_outputs()
+    target_output_name = None
+
+    TARGET_VISION_NODE = "image_embeds" 
     
-    return session.run([target_output], onnx_inputs)[0]
+    return session.run([TARGET_VISION_NODE], onnx_inputs)[0]
 
 
 def get_image_embedding(pixel_values):
@@ -75,9 +78,16 @@ def get_image_embeddings_batch(pixel_values_batch):
 def get_text_embedding(inputs):
     """
     Generuje embedding dla podanego słownika wejść tokenizera.
+    Bezpieczny dla pojedynczych zapytań oraz masowego przetwarzania (Batch).
     """
     session = _get_active_session("text")
     onnx_inputs = {}
+    
+    # 🚀 POPRAWKA 1: Dynamicznie pobieramy rozmiar paczki z wejść tokenizera
+    # Szukamy klucza 'input_ids', który zawsze określa wielkość paczki tekstu
+    batch_size = 1
+    if "input_ids" in inputs:
+        batch_size = inputs["input_ids"].shape[0]
     
     # Mapowanie danych z tokenizera do grafu obliczeniowego
     for inp in session.get_inputs():
@@ -96,19 +106,19 @@ def get_text_embedding(inputs):
             elif 'int64' in inp.type:
                 input_data = input_data.astype(np.int64)
             onnx_inputs[inp.name] = input_data
+            
         elif config.IS_UNIFIED and "pixel" in inp.name.lower():
-            # Jeśli model jest zunifikowany, a my liczymy tekst, podajemy puste zdjęcie-atrapę.
-            # Use the configured vision image size, not a filename heuristic.
+            # 🚀 POPRAWKA 2: Atrapa obrazu idealnie dopasowuje się do rozmiaru paczki tekstów
             resolution = config.IMAGE_SIZE
-            onnx_inputs[inp.name] = np.zeros((1, 3, resolution, resolution), dtype=np.float32)
+            onnx_inputs[inp.name] = np.zeros((batch_size, 3, resolution, resolution), dtype=np.float32)
 
-    outputs = session.run(None, onnx_inputs)
-    output_names = [out.name for out in session.get_outputs()]
+    # 🚀 POPRAWKA 3: Precyzyjne celowanie w wyjście (bez niepotrzebnego run(None))
+    TARGET_TEXT_NODE = "text_embeds"
     
-    # Inteligentne wyciąganie warstwy embeddingu tekstowego
-    if "text_embeds" in output_names:
-        text_embedding = outputs[output_names.index("text_embeds")]
+    output_names = [out.name for out in session.get_outputs()]
+    if TARGET_TEXT_NODE in output_names:
+        return session.run([TARGET_TEXT_NODE], onnx_inputs)[0]
     else:
-        text_embedding = next((out for out in outputs if len(out.shape) == 2), outputs[0])
-        
-    return text_embedding
+        # Fallback dla starych / nie-zunifikowanych modeli
+        fallback_node = next((out.name for out in session.get_outputs() if len(out.shape) == 2), output_names[0])
+        return session.run([fallback_node], onnx_inputs)[0]

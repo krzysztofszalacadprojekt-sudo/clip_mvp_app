@@ -158,37 +158,6 @@ def embed_images_batch(image_paths: List[str]):
 
     feats = np.concatenate(feats, axis=0).astype(np.float32)
     return feats, valid_paths
-
-def create_and_save_embeddings(image_paths: List[str] = None):
-    """
-    Creates embeddings for all images in the IMAGES_DIR using batch processing,
-    builds a FAISS index, and saves it to disk.
-    If image_paths is provided, it uses that list instead of searching the directory.
-    """
-    if image_paths is None:
-        valid_exts = {".jpg", ".jpeg", ".png", ".webp"}
-        image_paths = [p for p in Path(IMAGES_DIR).rglob("*") if p.suffix.lower() in valid_exts]
-
-    # Normalize all paths (absolute + resolved) so comparisons are consistent
-    image_paths = [Path(p).expanduser().resolve() for p in image_paths]
-    
-    if not image_paths:
-        print("No images found to embed.")
-        return
-
-    embeddings, valid_paths = embed_images_batch(image_paths)
-
-    if embeddings.shape[0] == 0:
-        print("No embeddings were generated.")
-        return
-
-    index = faiss.IndexFlatIP(embeddings.shape[1])
-    index.add(embeddings)
-
-    faiss.write_index(index, str(FAISS_INDEX_PATH))
-
-    with open(IMAGE_PATHS_LIST, "w", encoding="utf-8") as f:
-        json.dump(valid_paths, f)
         
 def load_index_and_paths():
     """
@@ -204,225 +173,69 @@ def load_index_and_paths():
     with open(IMAGE_PATHS_LIST, "r", encoding="utf-8") as f:
         image_paths = json.load(f)
 
-    normalized_paths = [p.replace("/", "\\").strip() for p in image_paths]
+    normalized_paths = [p.replace("\\", "/").strip() for p in image_paths]
 
     return index, normalized_paths
 
 def search_similar_images(query_embedding, index, image_paths, top_k=5):
     """
     Bezpieczna funkcja przeszukiwania indeksu FAISS.
-    Odporna na błędy synchronizacji (IndexError) oraz puste wyniki (-1).
+    Odporna na błędy synchronizacji, puste wyniki oraz znikające pliki na dysku.
     """
     query_embedding = query_embedding.astype('float32')
     faiss.normalize_L2(query_embedding)
     
-    distances, indices = index.search(query_embedding, top_k)
+    # 🚀 ROZWIĄZANIE: Pobieramy lekki zapas z FAISS na wypadek, gdyby jakiś plik został usunięty
+    search_k = max(top_k + 5, top_k * 2)
+    distances, indices = index.search(query_embedding, search_k)
     
     results = []
-    # Sprawdzenie czy FAISS w ogóle cokolwiek zwrócił
     if len(indices) == 0 or len(indices[0]) == 0:
         return results
         
-    for i in range(top_k):
-        if i < len(indices[0]):
-            idx = indices[0][i]
+    # 🚀 OPTYMALIZACJA: Elegancka iteracja po parach (indeks pętli, wartość z FAISS)
+    for i, idx in enumerate(indices[0]):
+        # FAISS zwraca -1, jeśli brak mu rekordów w indeksie
+        if idx == -1:
+            continue
             
-            # FAISS zwraca -1, jeśli indeks jest pusty lub szukamy więcej wyników niż jest w bazie
-            if idx == -1:
-                continue
+        # Defensywne sprawdzenie granic tablicy
+        if 0 <= idx < len(image_paths):
+            path_to_add = IMAGES_DIR / image_paths[idx]
+            
+            if path_to_add.exists():
+                results.append({
+                    "path": str(path_to_add),
+                    "distance": float(distances[0][i])
+                })
                 
-            # Defensywne sprawdzenie granic tablicy (Zabezpieczenie przed list index out of range)
-            if 0 <= idx < len(image_paths):
-                path_to_add = IMAGES_DIR / image_paths[idx]
-                if path_to_add.exists():
-                    results.append(
-                        {
-                            "path": str(path_to_add),
-                            "distance": float(distances[0][i])
-                        }
-                    )
-            else:
-                print(f"⚠️ [Defensive Guard] FAISS zwrócił indeks {idx}, ale image_paths ma tylko {len(image_paths)} elementów! Pomijam.")
+                # 🚀 KLUCZOWE: Gdy uzbieramy dokładnie tyle sprawnych plików, ile chciał użytkownik – kończymy
+                if len(results) == top_k:
+                    break
+        else:
+            print(f"⚠️ [Defensive Guard] FAISS zwrócił indeks {idx}, ale image_paths ma tylko {len(image_paths)} elementów! Pomijam.")
                 
     return results
-
-def update_embeddings(directories: List[str]):
-
-    print("=== UPDATE EMBEDDINGS ===")
-    print("Directories:", directories)
-
-    index, image_paths = load_index_and_paths()
-
-    existing_paths = (
-        set(str(Path(p).expanduser().resolve())
-            for p in image_paths)
-        if image_paths
-        else set()
-    )
-
-    normalized_dirs = []
-
-    for directory in directories:
-        try:
-            d = Path(directory).expanduser().resolve()
-
-            if not d.exists():
-                print(f"⚠️ Directory not found: {directory}")
-                continue
-
-            normalized_dirs.append(d)
-
-        except Exception as e:
-            print(f"⚠️ Failed resolving path {directory}: {e}")
-
-    valid_exts = {".jpg", ".jpeg", ".png", ".webp"}
-
-    # =====================================================
-    # CREATE NEW INDEX
-    # =====================================================
-    if index is None:
-
-        all_image_paths = []
-
-        print("Scanning images recursively...")
-
-        for d in normalized_dirs:
-            print(f"Scanning: {d}")
-
-            for p in d.rglob("*"):
-
-                if (
-                    p.is_file()
-                    and p.suffix.lower() in valid_exts
-                ):
-                    all_image_paths.append(str(p.resolve()))
-
-        print(f"Found {len(all_image_paths)} images")
-
-        if not all_image_paths:
-            return "No images found to create index."
-
-        create_and_save_embeddings(all_image_paths)
-
-        return (
-            f"Created new index with "
-            f"{len(all_image_paths)} images."
-        )
-
-    # =====================================================
-    # UPDATE EXISTING INDEX
-    # =====================================================
-    new_image_paths = []
-
-    print("Looking for new images...")
-
-    for d in normalized_dirs:
-
-        for p in d.rglob("*"):
-
-            if (
-                p.is_file()
-                and p.suffix.lower() in valid_exts
-            ):
-
-                try:
-                    resolved = str(
-                        p.expanduser().resolve()
-                    )
-
-                    if resolved not in existing_paths:
-                        new_image_paths.append(resolved)
-                        existing_paths.add(resolved)
-
-                except Exception as e:
-                    print(
-                        f"⚠️ Failed resolving "
-                        f"{p}: {e}"
-                    )
-
-    print(f"New images found: {len(new_image_paths)}")
-
-    if not new_image_paths:
-        return "No new images found."
-
-    print("Generating embeddings...")
-
-    try:
-        new_embeddings, valid_new_paths = embed_images_batch(
-            new_image_paths
-        )
-
-    except Exception as e:
-        print(f"❌ Embedding generation failed: {e}")
-        traceback.print_exc()
-
-        return "Embedding generation failed."
-
-    if new_embeddings.shape[0] == 0:
-        return "Could not generate embeddings."
-
-    print("Adding embeddings to FAISS...")
-
-    index.add(new_embeddings)
-
-    print("Saving FAISS index...")
-
-    # =====================================
-    # ATOMIC SAVE (IMPORTANT)
-    # =====================================
-    tmp_index = str(FAISS_INDEX_PATH) + ".tmp"
-
-    faiss.write_index(index, tmp_index)
-
-    os.replace(
-        tmp_index,
-        str(FAISS_INDEX_PATH)
-    )
-
-    updated_image_paths = (
-        image_paths + valid_new_paths
-    )
-
-    tmp_json = str(IMAGE_PATHS_LIST) + ".tmp"
-
-    with open(tmp_json, "w", encoding="utf-8") as f:
-        json.dump(
-            updated_image_paths,
-            f,
-            ensure_ascii=False,
-            indent=2
-        )
-
-    os.replace(
-        tmp_json,
-        IMAGE_PATHS_LIST
-    )
-
-    print("✅ Update finished.")
-
-    return (
-        f"Embeddings updated with "
-        f"{len(valid_new_paths)} new images."
-    )
 
 def update_embeddings_from_db(db_path: str) -> str:
     """
     Lekka, produkcyjna pętla uzgadniania stanu dla ścieżek względnych.
-    Gwarantuje relację 1-do-wielu bez dublowania pracy SigLIP 2.
+    Gwarantuje relację 1-do-wielu i posiada pancerne zabezpieczenie przed rozjazdem kolejności.
     """
     print("\n=== SYSTEM SYNCHRONIZACJI PRODUKCYJNEJ (Ścieżki Względne) ===")
     start_check = time.time()
-    CHECKPOINT_SIZE = 1000
+    
+    # 💡 PODPOWIEDŹ: Jeśli Twoja karta ma mało VRAM, możesz zmniejszyć checkpoint do 256 lub 512
+    CHECKPOINT_SIZE = 512 
 
     # 1. Odczyt aktualnego stanu relatywnego z dysku
     index, image_paths_list = load_index_and_paths()
     if image_paths_list is None:
         image_paths_list = []
-    existing_paths = set(image_paths_list)
 
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
-    
+
     path_groups = {}
     images_to_embed = []
     healed_to_exists = 0
@@ -430,45 +243,52 @@ def update_embeddings_from_db(db_path: str) -> str:
 
     try:
         cursor = conn.cursor()
-        
-        # Pobieramy wszystkie ścieżki z bazy (które są już relatywne)
-        cursor.execute("SELECT id, name, jpg_path, image_embedding_exists FROM models WHERE jpg_path IS NOT NULL")
+
+        # 🚀 POPRAWKA 1: Usunięto sztywny LIMIT 1100, aby pętla mogła przetworzyć całą bazę
+        cursor.execute("SELECT id, name, jpg_path, image_embedding_exists FROM models WHERE jpg_path IS NOT NULL ORDER BY id")
         rows = cursor.fetchall()
 
         if not rows:
+            conn.close()
             return "Baza danych SQLite jest pusta."
 
-        # KROK A: Grupowanie po ścieżkach względnych z uwzględnieniem IMAGES_DIR
+        # KROK A: Grupowanie pod system Windows/Linux
         with conn:
             for row in rows:
                 model_id = row["id"]
                 db_flag = row["image_embedding_exists"]
-                rel_path = row["jpg_path"].strip()
+                db_path_str = row["jpg_path"].strip()
 
-                # Poprawka rozszerzenia, jeśli baza go nie miała
-                p_rel = Path(rel_path)
+                if not db_path_str:
+                    continue
+
+                p_rel = Path(db_path_str)
                 if not p_rel.suffix:
                     p_rel = p_rel.with_suffix(".jpg")
-                    rel_path = str(p_rel)
+                    db_path_str = str(p_rel)
 
-                # 🚀 SPRAWDZENIE: Łączymy bazę klienta ze ścieżką względną
-                if (IMAGES_DIR / rel_path).exists():
-                    # 🎯 KLUCZEM w słowniku staje się unikalna ścieżka WZGLĘDNA
-                    if rel_path not in path_groups:
-                        path_groups[rel_path] = []
-                    path_groups[rel_path].append({"id": model_id, "flag": db_flag})
+                full_path = Path(db_path_str)
+                if not full_path.is_absolute():
+                    full_path = IMAGES_DIR / db_path_str
 
-        
-        normalized_existing = {p.lower() for p in image_paths_list}
-                
+                if full_path.exists():
+                    try:
+                        rel_path_str = str(full_path.relative_to(IMAGES_DIR))
+                        norm_key = rel_path_str.replace('\\', '/').lower()
+
+                        if norm_key not in path_groups:
+                            path_groups[norm_key] = []
+                        path_groups[norm_key].append({"id": model_id, "flag": db_flag})
+                    except ValueError:
+                        print(f"⚠️ Path {db_path_str} is not within the configured IMAGES_DIR. Skipping.")
+
+        normalized_existing = {p.replace('\\', '/').lower() for p in image_paths_list}
+
+        # KROK B: Uzgadnianie flag i kolejka
         with conn:
-            for rel_path, models in path_groups.items():
-                # 2. Ścieżkę z bazy danych przed testem "in" traktujemy dokładnie tak samo
-                lookup_path = rel_path.lower()
+            for norm_key, models in path_groups.items():
+                is_in_faiss = norm_key in normalized_existing
 
-                # Teraz dopasowanie zadziała zawsze, niezależnie od formatu pliku
-                is_in_faiss = lookup_path in normalized_existing
-                
                 for m in models:
                     if is_in_faiss and m["flag"] == 0:
                         cursor.execute("UPDATE models SET image_embedding_exists = 1 WHERE id = ?", (m["id"],))
@@ -476,13 +296,13 @@ def update_embeddings_from_db(db_path: str) -> str:
                     elif not is_in_faiss and m["flag"] == 1:
                         cursor.execute("UPDATE models SET image_embedding_exists = 0 WHERE id = ?", (m["id"],))
                         healed_to_missing += 1
-                
+
                 if not is_in_faiss:
-                    images_to_embed.append(rel_path)
+                    images_to_embed.append(norm_key)
 
         print(f"⏱️ Weryfikacja spójności unikalnych zasobów zakończona w {time.time() - start_check:.4f}s.")
         print(f"📊 Statystyki struktury: Wykryto {len(path_groups)} unikalnych zdjęć dla {len(rows)} modeli bazy.")
-        
+
         if healed_to_exists > 0 or healed_to_missing > 0:
             print(f"⚡ [Self-Healing] Dostrojono flagi: oznaczono jako istniejące: {healed_to_exists}, zresetowano: {healed_to_missing}")
 
@@ -493,49 +313,72 @@ def update_embeddings_from_db(db_path: str) -> str:
         print(f"🚀 Do faktycznego przetworzenia przez SigLIP 2 pozostało: {total_images_to_process} UNIKALNYCH obrazów.")
         print(f"💾 Punkty kontrolne (Checkpoints) zabezpieczą dysk co {CHECKPOINT_SIZE} zdjęć.")
 
-        # --- GŁÓWNA PĘTLA BLOKOWA DLA EMBEDDINGÓW ---
         checkpoint_count = 0
         for i in range(0, total_images_to_process, CHECKPOINT_SIZE):
             chunk_paths = images_to_embed[i : i + CHECKPOINT_SIZE]
             current_block_num = (i // CHECKPOINT_SIZE) + 1
             total_blocks = (total_images_to_process + CHECKPOINT_SIZE - 1) // CHECKPOINT_SIZE
-            
+
             print(f"\n📦 [Blok {current_block_num}/{total_blocks}] Przetwarzanie partii {len(chunk_paths)} unikalnych zdjęć...")
-            
-            # 🚀 KLUCZOWE: Budujemy ścieżki absolutne TYLKO dla modelu AI, żeby mógł otworzyć plik obrazu
-            absolute_chunk_paths = [str((IMAGES_DIR / p).resolve()) for p in chunk_paths]
-            
-            new_embeddings, valid_absolute_paths = embed_images_batch(absolute_chunk_paths)
-            
-            if new_embeddings.shape[0] == 0 or not valid_absolute_paths:
+
+            absolute_chunk_paths = [str(IMAGES_DIR / p) for p in chunk_paths]
+
+            # Inferencja masowa na GPU
+            new_img_embeddings, valid_absolute_paths = embed_images_batch(absolute_chunk_paths)
+
+            if new_img_embeddings.shape[0] == 0 or not valid_absolute_paths:
                 continue
 
-            # 🚀 KLUCZOWE: Po powrocie z AI, obcinamy przedrostek z powrotem do formatu względnego dla pliku JSON
-            valid_relative_paths = [str(Path(p).relative_to(IMAGES_DIR)) for p in valid_absolute_paths]
+            # 🚀 POPRAWKA 2: PANCERNY GUARD-RAIL GEOMETRII
+            # Jeśli biblioteka pod spodem zgubiła asymetrię między wektorami a ścieżkami, natychmiast zatrzymujemy proces,
+            # zamiast pozwolić na ciche uszkodzenie bazy danych.
+            if new_img_embeddings.shape[0] != len(valid_absolute_paths):
+                raise RuntimeError(
+                    f"🛑 [KRYTYCZNY BŁĄD ASYMETRII MOCKA] Funkcja embed_images_batch zwróciła "
+                    f"{new_img_embeddings.shape[0]} embeddingów, ale {len(valid_absolute_paths)} ścieżek! "
+                    f"Zablokowano zapis checkpointu przed uszkodzeniem indeksu FAISS."
+                )
 
+            valid_relative_paths = [str(Path(p).relative_to(IMAGES_DIR)).replace('\\', '/') for p in valid_absolute_paths]
+
+            models_flags_updates = []
+            embeddings_upserts = []
+
+            for idx, rel_path in enumerate(valid_relative_paths):
+                vector_bytes = new_img_embeddings[idx].astype(np.float32).tobytes()
+                lookup_key = rel_path.lower()
+                associated_models = path_groups.get(lookup_key, [])
+
+                for m in associated_models:
+                    models_flags_updates.append((m["id"],))
+                    embeddings_upserts.append((m["id"], vector_bytes))
+
+            # Aktualizacja struktur pamięciowych FAISS
             if index is None:
-                index = faiss.IndexFlatIP(new_embeddings.shape[1])
-            
-            index.add(new_embeddings)
+                index = faiss.IndexFlatIP(new_img_embeddings.shape[1])
+
+            index.add(new_img_embeddings)
             image_paths_list.extend(valid_relative_paths)
 
-            # Zapis indeksu .bin
+            # Atomowy zapis plików indeksu FAISS na dysk twardy
             tmp_index = str(FAISS_INDEX_PATH) + ".tmp"
             faiss.write_index(index, tmp_index)
             os.replace(tmp_index, str(FAISS_INDEX_PATH))
-            
-            # Zapis ścieżek .json (Tylko czyste ścieżki względne!)
+
             tmp_json = str(IMAGE_PATHS_LIST) + ".tmp"
             with open(tmp_json, "w", encoding="utf-8") as f:
                 json.dump(image_paths_list, f, ensure_ascii=False, indent=2)
             os.replace(tmp_json, IMAGE_PATHS_LIST)
 
-            # Masowa aktualizacja flag '1' w SQLite dla wszystkich powiązanych modeli
             with conn:
-                for rel_path in valid_relative_paths:
-                    associated_models = path_groups.get(rel_path, [])
-                    for m in associated_models:
-                        cursor.execute("UPDATE models SET image_embedding_exists = 1 WHERE id = ?", (m["id"],))
+                if models_flags_updates:
+                    cursor.executemany("UPDATE models SET image_embedding_exists = 1 WHERE id = ?", models_flags_updates)
+                if embeddings_upserts:
+                    cursor.executemany("""
+                        INSERT INTO model_embeddings (model_id, image_vector)
+                        VALUES (?, ?)
+                        ON CONFLICT(model_id) DO UPDATE SET image_vector = excluded.image_vector
+                    """, embeddings_upserts)
 
             checkpoint_count += len(valid_relative_paths)
             print(f"🔒 [Checkpoint Zablokowany] Postęp zapisu unikalnych: {i + len(chunk_paths)} / {total_images_to_process}")

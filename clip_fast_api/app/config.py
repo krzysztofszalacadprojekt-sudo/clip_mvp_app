@@ -33,12 +33,7 @@ MODELS_DIR = Path(
     )
 )
 
-IMAGES_DIR = Path(
-    os.getenv(
-        "IMAGES_DIR",
-        "C:/CADProjekt/CAD Decor PRO v. 4.0.4v2"
-    )
-)
+IMAGES_DIR = PROJECT_DIR.parent
 
 EMBEDDINGS_DIR = Path(
     os.getenv(
@@ -95,7 +90,6 @@ except Exception:
 FAISS_INDEX_PATH = EMBEDDINGS_DIR / "faiss_index.bin"
 IMAGE_PATHS_LIST = EMBEDDINGS_DIR / "image_paths.json"
 
-
 # =====================================================================
 # 5. ENVIRONMENT SELF-HEALING
 # =====================================================================
@@ -105,10 +99,15 @@ for directory in [MODELS_DIR, IMAGES_DIR, EMBEDDINGS_DIR]:
 # 6. Database path for SQLite storage of embeddings and metadata
 DB_PATH = EMBEDDINGS_DIR / "models.db"
 
+# IMAGES_DIR / \paczka_mvp\search_client\build\Release
+CPP_APP_DIR = IMAGES_DIR / "paczka_mvp" / "search_client" / "build" / "Release"
+
 print("\n===== CONFIG =====")
+print("CAD DECOR DIR :", IMAGES_DIR)
 print("PROJECT_DIR :", PROJECT_DIR)
 print("MODELS_DIR  :", MODELS_DIR)
 print("DATA_DIR    :", EMBEDDINGS_DIR)
 print("DB_PATH     :", DB_PATH)
 print("DB_EXISTS   :", DB_PATH.exists())
+print("CPP_APP_DIR :", CPP_APP_DIR)
 print("==================\n")
