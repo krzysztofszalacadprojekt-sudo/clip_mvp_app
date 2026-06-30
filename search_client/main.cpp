@@ -20,6 +20,10 @@ void menu() {
     std::cout << "1. Update embeddings\n";
     std::cout << "2. Search by text\n";
     std::cout << "3. Search by image\n";
+    std::cout << "4. Delete a specific model by file path\n";
+    std::cout << "5. Delete a random model\n";
+    std::cout << "6. Add a new model\n";
+    std::cout << "7. Rebuild index\n";
     std::cout << "0. Exit\n";
     std::cout << "Choose an option: ";
 }
@@ -328,6 +332,25 @@ std::string send_multipart_post(CURL* curl, const std::string& url, const std::s
     return response;
 }
 
+long send_delete_request(CURL* curl, const std::string& url, std::string& response) {
+    curl_easy_reset(curl);
+    
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "DELETE");
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+
+    CURLcode res = curl_easy_perform(curl);
+    long response_code = 0;
+    if (res == CURLE_OK) {
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
+        std::wcout << L"Response from " << utf8_to_wstring(url) << L" (HTTP " << response_code << "):\n" << utf8_to_wstring(response) << L"\n";
+    } else {
+        std::wcout << L"Request failed (" << utf8_to_wstring(url) << L"): " << utf8_to_wstring(curl_easy_strerror(res)) << L"\n";
+    }
+    return response_code;
+}
+
 int main() {
 
     curl_global_init(CURL_GLOBAL_DEFAULT);
@@ -443,15 +466,86 @@ target_image=C:/Users/CAD/Desktop/clip_fast_api/images/sofa.jpg
                 break;
             }
 
-            // case 4: {
-            //     std::string search_query = config["text"];
-                
-            //     std::cout << "Searching databases for: '" << search_query << "'...\n";
-            //     std::string response = send_json_post(curl, base_url + "/find-similar-images-by-text", "{\"text\": \"" + search_query + "\", \"top_k\": " + top_k + "}");
+            case 4: {
+                std::string dwx_path;
+                std::cout << "Enter the DWX file path of the model to delete: ";
+                std::getline(std::cin, dwx_path);
 
-            //     process_and_display_results(response);
-            //     break;
-            // }
+                if (dwx_path.empty()) {
+                    std::cout << "⚠️ Path cannot be empty!\n";
+                    break;
+                }
+                
+                char* encoded_path = curl_easy_escape(curl, dwx_path.c_str(), dwx_path.length());
+                if(encoded_path) {
+                    std::string url = base_url + "/model?dwx_path=" + encoded_path;
+                    curl_free(encoded_path);
+                    
+                    std::string response;
+                    long status_code = send_delete_request(curl, url, response);
+                    
+                    if (status_code >= 200 && status_code < 300) {
+                        std::cout << "Model deleted successfully. Now rebuilding index...\n";
+                        send_empty_post(curl, base_url + "/rebuild-index");
+                    } else {
+                        std::cout << "Failed to delete model. Server may be offline. Logging for later.\n";
+                        std::ofstream deletion_log("deletions.log", std::ios::app);
+                        if (deletion_log.is_open()) {
+                            deletion_log << "path:" << dwx_path << std::endl;
+                            deletion_log.close();
+                        }
+                    }
+                }
+                break;
+            }
+            case 5: {
+                std::cout << "Deleting a random model...\n";
+                std::string url = base_url + "/models/random";
+                std::string response;
+                long status_code = send_delete_request(curl, url, response);
+
+                if (status_code >= 200 && status_code < 300) {
+                    std::cout << "Model deleted successfully. Now rebuilding index...\n";
+                    send_empty_post(curl, base_url + "/rebuild-index");
+                } else {
+                    std::cout << "Failed to delete model. Server may be offline. Logging for later.\n";
+                    std::ofstream deletion_log("deletions.log", std::ios::app);
+                    if (deletion_log.is_open()) {
+                        // For random, we don't have an ID, so we can't really log it.
+                        // We'll log a generic message. The server will have to handle this.
+                        deletion_log << "random:1" << std::endl;
+                        deletion_log.close();
+                    }
+                }
+                break;
+            }
+            case 6: {
+                std::string model_path, model_name, jpg_path;
+                std::cout << "Enter model name: ";
+                std::getline(std::cin, model_name);
+                std::cout << "Enter model path (DWX): ";
+                std::getline(std::cin, model_path);
+                std::cout << "Enter image path (JPG): ";
+                std::getline(std::cin, jpg_path);
+
+                if (model_name.empty() || model_path.empty() || jpg_path.empty()) {
+                    std::cout << "⚠️ Model name, path, and JPG path cannot be empty!\n";
+                    break;
+                }
+
+                std::string escaped_name = escape_json_string(model_name);
+                std::string escaped_path = escape_json_string(model_path);
+                std::string escaped_jpg_path = escape_json_string(jpg_path);
+
+                std::string json_payload = "{\"name\": \"" + escaped_name + "\", \"path\": \"" + escaped_path + "\", \"jpg_path\": \"" + escaped_jpg_path + "\"}";
+                send_json_post(curl, base_url + "/add-model", json_payload);
+                break;
+            }
+            case 7: {
+                std::cout << "Rebuilding index...\n";
+                send_empty_post(curl, base_url + "/rebuild-index");
+                break;
+            }
 
             default:
                 std::cout << "Invalid choice. Try again.\n";

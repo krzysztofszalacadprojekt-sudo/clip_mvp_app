@@ -336,3 +336,80 @@ def sync_database_with_filesystem(db_path: str) -> None:
         raise
     finally:
         conn.close()
+
+
+def delete_model_by_id(db_path: str, model_id: int) -> bool:
+    """
+    Deletes a model from the database by its ID.
+    Thanks to 'ON DELETE CASCADE', associated embeddings are also removed.
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("PRAGMA foreign_keys = ON;")
+        with conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM models WHERE id = ?", (model_id,))
+            # Check if any row was affected
+            if cursor.rowcount > 0:
+                logger.info(f"✅ Successfully deleted model with ID: {model_id}")
+                return True
+            else:
+                logger.warning(f"⚠️ Model with ID {model_id} not found.")
+                return False
+    except sqlite3.Error as e:
+        logger.error(f"❌ Error while deleting model with ID {model_id}: {e}")
+        return False
+    finally:
+        conn.close()
+
+
+def delete_random_model(db_path: str) -> Optional[int]:
+    """
+    Deletes a random model from the database.
+    Returns the ID of the deleted model, or None if the database is empty.
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("PRAGMA foreign_keys = ON;")
+        with conn:
+            cursor = conn.cursor()
+            # First, get a random model ID
+            cursor.execute("SELECT id FROM models ORDER BY RANDOM() LIMIT 1")
+            result = cursor.fetchone()
+            
+            if result:
+                model_id = result[0]
+                cursor.execute("DELETE FROM models WHERE id = ?", (model_id,))
+                logger.info(f"✅ Successfully deleted random model with ID: {model_id}")
+                return model_id
+            else:
+                logger.warning("⚠️ Database is empty. No model to delete.")
+                return None
+    except sqlite3.Error as e:
+        logger.error(f"❌ Error while deleting random model: {e}")
+        return None
+    finally:
+        conn.close()
+
+
+def delete_model_by_dwx_path(db_path: str, dwx_path: str) -> bool:
+    """
+    Deletes a model from the database by its unique dwx_path.
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("PRAGMA foreign_keys = ON;")
+        with conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM models WHERE dwx_path = ?", (dwx_path,))
+            if cursor.rowcount > 0:
+                logger.info(f"✅ Successfully deleted model with dwx_path: {dwx_path}")
+                return True
+            else:
+                logger.warning(f"⚠️ Model with dwx_path '{dwx_path}' not found.")
+                return False
+    except sqlite3.Error as e:
+        logger.error(f"❌ Error while deleting model with dwx_path {dwx_path}: {e}")
+        return False
+    finally:
+        conn.close()

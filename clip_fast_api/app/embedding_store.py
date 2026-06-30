@@ -390,3 +390,108 @@ def update_embeddings_from_db(db_path: str) -> str:
         raise
     finally:
         conn.close()
+
+
+def rebuild_index_from_db(db_path: str) -> str:
+    """
+    Rebuilds the entire FAISS index and image paths list from the SQLite database.
+    This is intended to be called after models have been deleted from the database.
+    """
+    print("\n=== Rebuilding FAISS index from database ===")
+    start_time = time.time()
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    try:
+        # Fetch all existing image vectors and their corresponding relative paths
+        cursor.execute("""
+            SELECT T1.image_vector, T2.jpg_path
+            FROM model_embeddings AS T1
+            INNER JOIN models AS T2 ON T1.model_id = T2.id
+            WHERE T1.image_vector IS NOT NULL AND T2.jpg_path IS NOT NULL
+            ORDER BY T2.id;
+        """)
+        rows = cursor.fetchall()
+
+        if not rows:
+            # If no embeddings are in the DB, create empty files
+            index = faiss.IndexFlatIP(768) # Assuming 768 dimensions for CLIP
+
+            tmp_index_path = str(FAISS_INDEX_PATH) + ".tmp"
+            faiss.write_index(index, tmp_index_path)
+            os.replace(tmp_index_path, str(FAISS_INDEX_PATH))
+
+            tmp_json_path = str(IMAGE_PATHS_LIST) + ".tmp"
+            with open(tmp_json_path, "w", encoding="utf-8") as f:
+                json.dump([], f)
+            os.replace(tmp_json_path, str(IMAGE_PATHS_LIST))
+
+            return "Database has no embeddings. Created a new empty index."
+
+        vectors = []
+        image_paths = []
+        embedding_dim = -1
+
+        for row in rows:
+            # The vector is stored as a BLOB of float32 bytes
+            vector_blob = row["image_vector"]
+            # Assuming the vector dimension is 768 for CLIP base model
+            vec = np.frombuffer(vector_blob, dtype=np.float32)
+
+            if embedding_dim == -1:
+                embedding_dim = len(vec)
+
+            if len(vec) != embedding_dim:
+                print(f"⚠️ Warning: Skipping vector with unexpected dimension {len(vec)}. Expected {embedding_dim}.")
+                continue
+
+            vectors.append(vec)
+
+            # Use relative path, normalized
+            full_path = Path(row["jpg_path"])
+            if not full_path.is_absolute():
+                full_path = IMAGES_DIR / row["jpg_path"]
+
+            try:
+                rel_path_str = str(full_path.relative_to(IMAGES_DIR)).replace('\\', '/')
+                image_paths.append(rel_path_str)
+            except ValueError:
+                print(f"⚠️ Path {row['jpg_path']} is not within the configured IMAGES_DIR. Skipping.")
+                vectors.pop() # Remove the corresponding vector
+
+
+        if not vectors:
+            return "No valid vectors found in database to build index."
+
+        # Convert list of vectors to a 2D numpy array
+        np_vectors = np.array(vectors, dtype=np.float32)
+
+        # FAISS requires normalization for IndexFlatIP for cosine similarity
+        faiss.normalize_L2(np_vectors)
+
+        # Create a new FAISS index
+        index = faiss.IndexFlatIP(embedding_dim)
+        index.add(np_vectors)
+
+        # Atomically write the new index and paths list
+        print(f"Writing new index with {index.ntotal} vectors.")
+        tmp_index_path = str(FAISS_INDEX_PATH) + ".tmp"
+        faiss.write_index(index, tmp_index_path)
+        os.replace(tmp_index_path, str(FAISS_INDEX_PATH))
+
+        print(f"Writing new paths list with {len(image_paths)} paths.")
+        tmp_json_path = str(IMAGE_PATHS_LIST) + ".tmp"
+        with open(tmp_json_path, "w", encoding="utf-8") as f:
+            json.dump(image_paths, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_json_path, str(IMAGE_PATHS_LIST))
+
+        end_time = time.time()
+        return f"Successfully rebuilt FAISS index. Total vectors: {index.ntotal}. Time: {end_time - start_time:.2f}s."
+
+    except sqlite3.Error as e:
+        print(f"❌ Database error during index rebuild: {e}")
+        raise
+    finally:
+        conn.close()
